@@ -1,52 +1,128 @@
 /**
  * Dual Model Supervisor — RPC Method Registration
- *
- * Registers rc.supervisor.* RPC methods for Dashboard communication.
  */
 
-import type { RegisterMethod, SupervisorConfig, PluginLogger, ConfiguredProvider } from './core/types.js';
+import type {
+  RegisterMethod,
+  SupervisorConfig,
+  PluginLogger,
+  ConfiguredProvider,
+  TurnState,
+  TurnPhase,
+} from './core/types.js';
 import { DEFAULT_CONFIG } from './core/types.js';
+import type { TurnRegistry } from './core/turn-context.js';
+import type { SessionAnchorsRegistry, SessionAnchors } from './core/session-anchors.js';
 import { AuditLogService } from './core/audit-log.js';
 import { parseConfig } from './core/config.js';
 
-/**
- * Register all `rc.supervisor.*` RPC methods for Dashboard communication.
- * @param registerMethod     Gateway method registration callback
- * @param auditLog           Shared audit log service instance
- * @param getActiveConfig    Returns the current effective SupervisorConfig
- * @param setActiveConfig    Updates the active config and propagates to all components
- * @param logger             Plugin logger
- * @param getSessionStates   Returns the live session state map (optional)
- * @param getConfiguredProviders Returns the available model providers for reviewer (optional)
- */
+export interface SessionAnchorsRpc {
+  researchGoal?: string;
+  goalConfirmed: boolean;
+  methodology?: string;
+  targetConclusions: string[];
+  keyConclusions: string[];
+  userPreferences: string[];
+  methodologyDecisions: string[];
+}
+
+export interface TurnSummary {
+  turnId: string;
+  turnSeq: number;
+  phase: TurnPhase;
+  createdAt: number;
+  researchGoal?: string;
+  targetConclusions: string[];
+  goalConfirmed: boolean;
+  regenerateAttempts: number;
+  trivialTurn: boolean;
+  lastReviewReport?: string;
+}
+
+export interface SessionSummary {
+  sessionId: string;
+  researchGoal?: string;
+  targetConclusions: string[];
+  goalConfirmed: boolean;
+  anchors: SessionAnchorsRpc;
+  activeTurns: TurnSummary[];
+}
+
+function toAnchorsRpc(a: Readonly<SessionAnchors>): SessionAnchorsRpc {
+  return {
+    researchGoal: a.researchGoal,
+    goalConfirmed: a.goalConfirmed,
+    methodology: a.methodology,
+    targetConclusions: [...a.targetConclusions],
+    keyConclusions: [...a.keyConclusions],
+    userPreferences: [...a.userPreferences],
+    methodologyDecisions: [...a.methodologyDecisions],
+  };
+}
+
+function summarizeTurn(turn: TurnState): TurnSummary {
+  const staged = turn.stagedAnchorUpdates;
+  return {
+    turnId: turn.turnId,
+    turnSeq: turn.turnSeq,
+    phase: turn.phase,
+    createdAt: turn.createdAt,
+    researchGoal: staged.researchGoal,
+    targetConclusions: staged.targetConclusions ? [...staged.targetConclusions] : [],
+    goalConfirmed: staged.goalConfirmed ?? false,
+    regenerateAttempts: turn.regenerateHistory.length,
+    trivialTurn: turn.trivialTurn === true,
+    lastReviewReport: turn.lastReviewReport,
+  };
+}
+
+function summarizeSessions(
+  registry: TurnRegistry,
+  anchorsReg: SessionAnchorsRegistry,
+): { activeSessions: number; sessions: SessionSummary[] } {
+  const sessionIds = new Set<string>([...registry.listSessions(), ...anchorsReg.listSessions()]);
+  const sessions: SessionSummary[] = [];
+
+  for (const sessionId of sessionIds) {
+    const turns = registry.listActive(sessionId);
+    const anchorView = anchorsReg.view(sessionId);
+    if (turns.length === 0 && !anchorView.researchGoal && anchorView.targetConclusions.length === 0) {
+      continue;
+    }
+
+    sessions.push({
+      sessionId,
+      researchGoal: anchorView.researchGoal,
+      targetConclusions: [...anchorView.targetConclusions],
+      goalConfirmed: anchorView.goalConfirmed,
+      anchors: toAnchorsRpc(anchorView),
+      activeTurns: turns.map(summarizeTurn),
+    });
+  }
+
+  return { activeSessions: sessions.length, sessions };
+}
+
 export function registerSupervisorRpc(
   registerMethod: RegisterMethod,
   auditLog: AuditLogService,
   getActiveConfig: () => SupervisorConfig,
   setActiveConfig: (cfg: SupervisorConfig) => void,
   logger: PluginLogger,
-  getSessionStates?: () => Map<string, import('./core/types.js').SessionState>,
+  getTurnRegistry?: () => TurnRegistry,
   getConfiguredProviders?: () => ConfiguredProvider[],
-  persistConfig?: (cfg: SupervisorConfig) => void,
+  getAnchorsRegistry?: () => SessionAnchorsRegistry,
 ): void {
   registerMethod('rc.supervisor.status', async () => {
     const cfg = getActiveConfig();
     const stats = auditLog.getStats();
 
-    // Include active session info if available
     let activeSessions = 0;
-    let sessionsInfo: Array<{ sessionId: string; researchGoal?: string; targetConclusions: string[]; goalConfirmed: boolean }> = [];
-    if (getSessionStates) {
-      const states = getSessionStates();
-      activeSessions = states.size;
-      for (const [, state] of states) {
-        sessionsInfo.push({
-          sessionId: state.sessionId,
-          researchGoal: state.researchGoal,
-          targetConclusions: state.targetConclusions,
-          goalConfirmed: state.goalConfirmed,
-        });
-      }
+    let sessionsInfo: SessionSummary[] = [];
+    if (getTurnRegistry && getAnchorsRegistry) {
+      const summary = summarizeSessions(getTurnRegistry(), getAnchorsRegistry());
+      activeSessions = summary.activeSessions;
+      sessionsInfo = summary.sessions;
     }
 
     return {
@@ -69,32 +145,8 @@ export function registerSupervisorRpc(
   registerMethod('rc.supervisor.config', async (params) => {
     if (params && typeof params === 'object' && Object.keys(params).length > 0) {
       const current = getActiveConfig();
-      // Only accept known config keys — reject arbitrary params
-      const ALLOWED_KEYS = [
-        'enabled', 'supervisorModel', 'reviewMode',
-        'appendReviewToChannelOutput', 'memoryGuard',
-        'courseCorrection', 'highRiskTools',
-      ] as const;
-      const filtered: Record<string, unknown> = {};
-      for (const key of ALLOWED_KEYS) {
-        if (key in (params as Record<string, unknown>)) {
-          filtered[key] = (params as Record<string, unknown>)[key];
-        }
-      }
-      if (Object.keys(filtered).length === 0) {
-        return { ok: true, config: current };
-      }
-      // Deep-merge nested config objects to preserve sub-fields on partial updates
-      const merged: Record<string, unknown> = { ...current, ...filtered };
-      if (filtered.memoryGuard && typeof filtered.memoryGuard === 'object' && current.memoryGuard) {
-        merged.memoryGuard = { ...current.memoryGuard, ...(filtered.memoryGuard as Record<string, unknown>) };
-      }
-      if (filtered.courseCorrection && typeof filtered.courseCorrection === 'object' && current.courseCorrection) {
-        merged.courseCorrection = { ...current.courseCorrection, ...(filtered.courseCorrection as Record<string, unknown>) };
-      }
-      const updated = parseConfig(merged);
+      const updated = parseConfig({ ...current, ...params as Record<string, unknown> });
       setActiveConfig(updated);
-      persistConfig?.(updated);
       logger.info(`Supervisor config updated: mode=${updated.reviewMode}, model=${updated.supervisorModel}`);
       return { ok: true, config: updated };
     }
@@ -102,12 +154,11 @@ export function registerSupervisorRpc(
   });
 
   registerMethod('rc.supervisor.log', async (params) => {
-    const p = params as { limit?: number; offset?: number; sessionId?: string; type?: import('./core/types.js').AuditLogType; action?: string };
+    const p = params as { limit?: number; offset?: number; sessionId?: string; type?: string; action?: string };
     const entries = auditLog.list({
       limit: p.limit ?? 50,
       offset: p.offset ?? 0,
       sessionId: p.sessionId,
-      type: p.type,
       action: p.action,
     });
     return { entries, total: entries.length };
@@ -127,7 +178,6 @@ export function registerSupervisorRpc(
       reviewMode: enabled && current.reviewMode === 'off' ? 'correct' as const : current.reviewMode,
     };
     setActiveConfig(updated);
-    persistConfig?.(updated);
     logger.info(`Supervisor ${enabled ? 'enabled' : 'disabled'}`);
     return { ok: true, enabled: updated.enabled, reviewMode: updated.reviewMode };
   });

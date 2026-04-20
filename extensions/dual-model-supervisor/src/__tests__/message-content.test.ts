@@ -18,7 +18,7 @@ describe('messageContentToPlainText', () => {
     expect(s).toBe('x');
   });
 
-  it('truncates', () => {
-    expect(truncateMessagePlainText('abcdef', 3)).toBe('abc');
+  it('truncates with ellipsis marker', () => {
+    expect(truncateMessagePlainText('abcdef', 3)).toBe('abc…[truncated]');
   });
 });

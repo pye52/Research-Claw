@@ -2,6 +2,8 @@
  * Dual Model Supervisor — Core Type Definitions
  */
 
+import type { StagedAnchorPatch } from './session-anchors.js';
+
 // ── Configuration ──────────────────────────────────────────────────────
 
 export interface MemoryGuardConfig {
@@ -16,6 +18,12 @@ export interface CourseCorrectionConfig {
   maxRegenerateAttempts: number; // Max regeneration attempts per session (default: 3)
 }
 
+export interface PreReviewFilterConfig {
+  minContentLength: number;          // Minimum content length for local pre-check (default: 15)
+  gatekeeperMaxInputChars: number;   // Max input chars sent to gatekeeper (default: 200)
+  alwaysReviewToolCalls: boolean;    // Always review tool calls regardless of trivialTurn
+}
+
 export interface SupervisorConfig {
   enabled: boolean;                    // Whether supervisor is active
   supervisorModel: string;             // "provider/model" e.g. "openai/gpt-4o-mini"
@@ -24,6 +32,7 @@ export interface SupervisorConfig {
   appendReviewToChannelOutput: boolean;
   memoryGuard: MemoryGuardConfig;      // Memory protection settings
   courseCorrection: CourseCorrectionConfig;  // Course correction settings
+  preReviewFilter: PreReviewFilterConfig;    // Pre-review filter settings
   highRiskTools: string[];             // Tool names that require extra review
 }
 
@@ -42,19 +51,29 @@ export const DEFAULT_CONFIG: SupervisorConfig = {
     forceRegenerate: false,
     maxRegenerateAttempts: 3,
   },
+  preReviewFilter: {
+    minContentLength: 15,
+    gatekeeperMaxInputChars: 200,
+    alwaysReviewToolCalls: true,
+  },
   highRiskTools: ['exec', 'write', 'edit', 'send_notification', 'browser'],
 };
 
 // ── Review Results ─────────────────────────────────────────────────────
 
+export interface GatekeeperResult {
+  needReview: boolean;               // Whether the content needs in-depth review
+  reason: string;                    // Brief explanation of the decision
+}
+
 export interface ReviewResult {
   blocked: boolean;               // Whether the output was blocked entirely
   corrected: boolean;             // Whether correction was applied
-  correctedVersion?: string;      // The corrected version of the output (if corrected)
   correctionNote?: string;        // Explanation of what was corrected
   warnings: string[];             // Safety or quality warnings
   memoryAlerts: string[];         // Alerts about memory inconsistencies or loss
-  deviationScore: number;         // 0-1, how much the output deviates from expected trajectory
+  /** Optional telemetry only; session analysis owns deviation for force-regenerate. */
+  deviationScore?: number | null;
   qualityScore: number;           // 0-1, overall quality assessment
   reportText?: string;            // Natural-language review report from the supervisor model
 }
@@ -75,14 +94,12 @@ export interface ConsistencyCheckResult {
 export interface MemoryLossItem {
   category: string;               // Category of lost memory (e.g., 'research_goal')
   content: string;                // The actual content that was lost
-  importance: 'critical' | 'high' | 'medium';  // Importance level of lost memory
+  importance: 'critical' | 'high';
 }
 
 export interface MemoryItem {
   category: string;               // Memory category for organization
   summary: string;                // Concise summary of the memory
-  source: string;                 // Source of the memory (e.g., message_id, tool_call_id)
-  timestamp: number;              // When the memory was created/recorded
 }
 
 // ── Audit Log ──────────────────────────────────────────────────────────
@@ -106,11 +123,37 @@ export interface AuditLogEntry {
   timestamp: number;              // Unix timestamp in milliseconds
 }
 
-// ── Session State ──────────────────────────────────────────────────────
+// ── Turn State ─────────────────────────────────────────────────────────
+//
+// IMPORTANT: `TurnState` represents the complete state of ONE user message's
+// processing lifecycle (from `message_received` through `message_sending`).
+//
+// There is NO cross-turn state. Each new user message starts a fresh TurnState
+// with default empty values. Hook handlers within one turn share the same
+// TurnState instance; concurrent turns (e.g. user rapidly sending A then B)
+// have independent TurnState instances and never interfere with each other.
+//
+// Cross-hook correlation within a single turn is done via AsyncLocalStorage
+// (see `src/core/turn-context.ts`) — each turn's async chain carries its own
+// TurnState reference, so hooks pick it up automatically regardless of how
+// concurrent turns interleave in time.
+//
+// Session-level anchors (research goal, append-only lists) live in
+// `SessionAnchorsRegistry` (see `src/core/session-anchors.ts`); each turn
+// stages updates in `stagedAnchorUpdates` and merges on `message_sending`.
+
+export type {
+  SessionAnchors,
+  StagedAnchorPatch,
+  PendingBlock,
+  GoalReplaceHint,
+} from './session-anchors.js';
 
 export interface MessageSummary {
   claims: string[];                // Key claims or assertions made in this message
   decisions: string[];             // Decisions or conclusions reached
+  /** When present and same length as `decisions`, parallel classification per item (methodology | conclusion | other). */
+  decisionKinds?: Array<'methodology' | 'conclusion' | 'other'>;
   references: string[];            // External references cited (papers, URLs, etc.)
   conditions: string[];            // Preconditions, assumptions, or caveats for claims/decisions
   reasoning: string[];             // Key reasoning steps or logical chains that led to conclusions
@@ -123,6 +166,8 @@ export interface TaskParsingResult {
   researchGoal: string;            // Parsed research goal from user's initial message
   targetConclusions: string[];     // Expected conclusions or outcomes to achieve
   methodology?: string;            // Suggested methodology or approach
+  /** Compared to session anchor goal: whether incoming goal should replace the stable anchor. */
+  vsCurrentGoal?: 'replace' | 'keep' | 'unknown';
 }
 
 export interface RegenerateHistoryEntry {
@@ -134,32 +179,38 @@ export interface RegenerateHistoryEntry {
   result: 'regenerating' | 'corrected' | 'max_reached';  // Outcome of this attempt
 }
 
-export interface SessionState {
-  sessionId: string;               // Unique identifier for the conversation
-  researchGoal?: string;           // The main research goal identified for this session
-  targetConclusions: string[];     // Expected conclusions/outcomes to achieve (P2)
-  methodology?: string;            // Planned methodology or approach
-  goalConfirmed: boolean;          // Whether the reviewer model has confirmed the goal
-  keyConclusions: string[];        // Important conclusions reached during research
-  userPreferences: string[];       // User preferences or constraints noted
-  methodologyDecisions: string[];  // Decisions about research methodology
-  recentOutputs: string[];         // Recent model outputs (for consistency checking)
-  recentSummaries: MessageSummary[];  // Structured summaries of recent messages (P1)
-  lastLlmOutput?: string;          // The most recent raw LLM output (before correction)
-  pendingCourseCorrection?: string;  // Course correction pending injection in next prompt
-  pendingForceRegenerate?: {       // Force regeneration pending injection
-    deviationScore: number;
-    correctionInstruction: string;
-    originalOutputPreview: string;
-  };
-  regenerateAttempts: number;      // Number of regeneration attempts in this session
-  regenerateHistory: RegenerateHistoryEntry[];  // History of regeneration attempts
-  lostMemorySummary?: string;      // Summary of memories lost during conversation compression
-  preCompactionMemory: MemoryItem[];  // Memory snapshots before conversation compaction
-  pendingReviewFooter?: string;    // Cached review footer from llm_output (deprecated: for backward compat)
-  pendingChannelReviewFooter?: string; // Cached channel-only review footer, waiting to be attached in message_sending when delivering to external channel
-  lastReviewReport?: string;       // Most recent review report text (for Dashboard panel display)
-  lastStaticSupervisorInjectAt?: number;  // Per-session debounce for static rules injection
+/** Lifecycle phase of a turn, advanced by hook handlers as the pipeline progresses. */
+export type TurnPhase =
+  | 'received'   // message_received fired, awaiting prompt/llm_input
+  | 'llm_input'  // llm_input fired, awaiting llm_output
+  | 'llm_output' // llm_output fired, awaiting send
+  | 'sending'    // before_message_write or message_sending in progress
+  | 'sent';      // message_sending completed; turn finalized
+
+export interface TurnState {
+  // ── Turn identity ──
+  sessionId: string;               // Session this turn belongs to
+  turnSeq: number;                 // Monotonic per-session sequence number (1, 2, 3, …)
+  turnId: string;                  // `${sessionId}:${turnSeq}`, used for logs
+  phase: TurnPhase;                // Current lifecycle phase
+  createdAt: number;               // Timestamp (ms) when the turn was created
+  userMessage?: string;            // The user's message text (for fingerprint fallback)
+
+  /** Staged updates merged into `SessionAnchors` at end of `message_sending`. */
+  stagedAnchorUpdates: StagedAnchorPatch;
+
+  turnLlmOutput?: string;          // Raw LLM output of this turn
+
+  /**
+   * Signal flag for force regeneration (set by CourseCorrector, consumed by OutputReviewer).
+   */
+  forceRegeneratePending?: boolean;
+  regenerateHistory: RegenerateHistoryEntry[];  // History of regenerate attempts in this turn
+
+  // ── Output review pipeline (llm_output → message_sending hand-off within turn) ──
+  pendingChannelReviewFooter?: string; // Cached footer for channel delivery
+  lastReviewReport?: string;       // Human-readable review report (Dashboard display)
+  trivialTurn?: boolean;           // Pre-review filter verdict for this turn
 }
 
 // ── models.providers.* (aligned with Dashboard GatewayModelDef / openclaw.json) ──

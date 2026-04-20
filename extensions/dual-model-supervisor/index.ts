@@ -3,13 +3,17 @@
  *
  * Registers 7 hooks + 6 RPC methods for dual-model supervision:
  *   - Safety filtering (message_sending, before_tool_call)
- *   - Course correction (llm_output → session analysis, before_prompt_build, llm_input)
+ *   - Course correction (llm_output → session analysis, before_prompt_build, llm_input → consistency check → enqueueBlock)
  *   - Memory guarding (before_compaction, after_compaction)
  *   - Audit logging (SQLite)
  *   - Dashboard RPC (rc.supervisor.*)
+ *
+ * Per-turn `TurnState` (see `src/core/turn-context.ts`) isolates concurrent
+ * user messages. Session-level research anchors + append-only lists live in
+ * `SessionAnchorsRegistry` and merge at `message_sending`. Compaction snapshots
+ * use `CompactionEventRegistry` (see `src/core/compaction-event.ts`).
  */
 
-import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import Database from 'better-sqlite3';
@@ -18,9 +22,10 @@ import type {
   PluginApi,
   PluginDefinition,
   SupervisorConfig,
-  SessionState,
+  TurnState,
   ModelsProviderEntry,
   ConfiguredProvider,
+  GatekeeperResult,
 } from './src/core/types.js';
 import { parseConfig, isSupervisorActive, isCourseCorrectionActive } from './src/core/config.js';
 import { ReviewerClient } from './src/client/reviewer.js';
@@ -32,9 +37,19 @@ import { CourseCorrector } from './src/hooks/course-corrector.js';
 import { ConsistencyChecker } from './src/hooks/consistency-checker.js';
 import { GoalParser } from './src/hooks/goal-parser.js';
 import { SummaryExtractor } from './src/hooks/summary-extractor.js';
+import { PreReviewFilter } from './src/hooks/pre-review-filter.js';
 import { AuditLogService } from './src/core/audit-log.js';
+import { GATEKEEPER_SYSTEM_PROMPT } from './src/core/prompts.js';
 import { registerSupervisorRpc } from './src/rpc.js';
 import { snapshotMessageSendingCtx, SUPERVISOR_REVIEW_SUMMARY_MARKER } from './src/hooks/hook-context.js';
+import {
+  TurnRegistry,
+  turnStore,
+  resolveTurn,
+  extractLastUserMessageText,
+} from './src/core/turn-context.js';
+import { SessionAnchorsRegistry } from './src/core/session-anchors.js';
+import { CompactionEventRegistry } from './src/core/compaction-event.js';
 
 // ── Module-level state (survives multiple register() calls) ──────────
 let _initialized = false;
@@ -49,41 +64,15 @@ let _courseCorrector: CourseCorrector | null = null;
 let _consistencyChecker: ConsistencyChecker | null = null;
 let _goalParser: GoalParser | null = null;
 let _summaryExtractor: SummaryExtractor | null = null;
+let _preReviewFilter: PreReviewFilter | null = null;
 let _activeConfig: SupervisorConfig | null = null;
 
-/**
- * Best-effort session ID tracker for hooks that don't receive sessionId (e.g., before_prompt_build).
- * WARNING: In multi-session scenarios, this tracks only the LAST active session.
- * Hooks should prefer context.sessionId when available.
- */
+/** OpenClaw `message_received` often omits `sessionId`; we mirror it from the latest `session_start`. */
 let _hookActiveSessionId: string | null = null;
 
-const _sessionStates = new Map<string, SessionState>();
-let _hooksDone = false;
-
-function getOrCreateSession(sessionId: string): SessionState {
-  let state = _sessionStates.get(sessionId);
-  if (!state) {
-    state = {
-      sessionId,
-      targetConclusions: [],
-      goalConfirmed: false,
-      keyConclusions: [],
-      userPreferences: [],
-      methodologyDecisions: [],
-      recentOutputs: [],
-      recentSummaries: [],
-      preCompactionMemory: [],
-      regenerateAttempts: 0,
-      regenerateHistory: [],
-      pendingReviewFooter: undefined,
-      pendingChannelReviewFooter: undefined,
-      lastReviewReport: undefined,
-    };
-    _sessionStates.set(sessionId, state);
-  }
-  return state;
-}
+const _registry = new TurnRegistry();
+const _anchors = new SessionAnchorsRegistry();
+const _compactions = new CompactionEventRegistry();
 
 const DEFAULT_DB_PATH = path.join(os.homedir(), '.research-claw', 'supervisor.db');
 
@@ -91,6 +80,7 @@ const DEFAULT_DB_PATH = path.join(os.homedir(), '.research-claw', 'supervisor.db
  * Gate static supervisor rules: OpenClaw may call `before_prompt_build` several times per user turn;
  * each return value is concatenated, which previously duplicated this block 2–3×.
  */
+let _lastStaticSupervisorInjectAt = 0;
 const STATIC_SUPERVISOR_DEBOUNCE_MS = 1500;
 
 const STATIC_SUPERVISOR_RULES_BODY = [
@@ -100,23 +90,16 @@ const STATIC_SUPERVISOR_RULES_BODY = [
   '  - If you have forgotten key information discussed earlier, explicitly state: "I may have lost context, please remind me"',
 ].join('\n');
 
-function takeStaticSupervisorRulesBlock(reviewMode: string, state: SessionState | null): string {
+function takeStaticSupervisorRulesBlock(reviewMode: string): string {
   if (reviewMode === 'off') return '';
   const now = Date.now();
-  const lastInject = state?.lastStaticSupervisorInjectAt ?? 0;
-  if (now - lastInject < STATIC_SUPERVISOR_DEBOUNCE_MS) {
+  if (now - _lastStaticSupervisorInjectAt < STATIC_SUPERVISOR_DEBOUNCE_MS) {
     return '';
   }
-  if (state) {
-    state.lastStaticSupervisorInjectAt = now;
-  }
+  _lastStaticSupervisorInjectAt = now;
   return STATIC_SUPERVISOR_RULES_BODY;
 }
 
-/**
- * OpenClaw `llm_output` passes `assistantTexts` + `lastAssistant` (see gateway embedded run);
- * some paths may still set `response`.
- */
 /**
  * Extract the main model's text output from an `llm_output` hook context.
  * Handles multiple context shapes across gateway versions: `response`, `assistantTexts`,
@@ -151,11 +134,11 @@ function extractLlmOutputText(raw: Record<string, unknown>): string | undefined 
   return undefined;
 }
 
-function extractLlmInputMessages(ctx: unknown): Array<{ role: string; content: string }> | undefined {
+function extractLlmInputMessages(ctx: unknown): Array<{ role: string; content: unknown }> | undefined {
   const c = ctx as Record<string, unknown>;
-  const asMsgs = (v: unknown): Array<{ role: string; content: string }> | undefined => {
+  const asMsgs = (v: unknown): Array<{ role: string; content: unknown }> | undefined => {
     if (!Array.isArray(v) || v.length === 0) return undefined;
-    return v as Array<{ role: string; content: string }>;
+    return v as Array<{ role: string; content: unknown }>;
   };
   let m = asMsgs(c.messages);
   if (m) return m;
@@ -194,12 +177,7 @@ const plugin: PluginDefinition = {
     const globalCfg = api.config;
     const mergedProviders = _extractProviders(api.pluginConfig as Record<string, unknown> | undefined, globalCfg);
 
-    // Extract main model reference for fallback when supervisorModel is empty
-    const mainModel = (globalCfg?.agents as Record<string, unknown>)?.defaults as Record<string, unknown>;
-    const mainModelPrimary = (mainModel?.model as Record<string, unknown>)?.primary;
-    const fallbackModel = typeof mainModelPrimary === 'string' ? mainModelPrimary : '';
-
-    api.logger.info(`Dual Model Supervisor initializing (enabled=${cfg.enabled}, mode=${cfg.reviewMode}, model=${cfg.supervisorModel || `(inherit: ${fallbackModel})` || '(none)'})`);
+    api.logger.info(`Dual Model Supervisor initializing (enabled=${cfg.enabled}, mode=${cfg.reviewMode}, model=${cfg.supervisorModel || '(none)'})`);
 
     if (!_initialized) {
       _db = new Database(DEFAULT_DB_PATH);
@@ -212,7 +190,6 @@ const plugin: PluginDefinition = {
         supervisorConfig: cfg,
         providers: mergedProviders,
         logger: api.logger,
-        fallbackModel,
       });
 
       _quickChecker = new QuickChecker(cfg, api.logger);
@@ -223,6 +200,7 @@ const plugin: PluginDefinition = {
       _consistencyChecker = new ConsistencyChecker(cfg, api.logger, _reviewerClient, _auditLog);
       _goalParser = new GoalParser(cfg, api.logger, _reviewerClient, _auditLog);
       _summaryExtractor = new SummaryExtractor(cfg, api.logger, _reviewerClient, _auditLog);
+      _preReviewFilter = new PreReviewFilter(cfg.preReviewFilter, api.logger);
 
       process.once('exit', () => {
         try {
@@ -237,7 +215,6 @@ const plugin: PluginDefinition = {
     } else {
       _reviewerClient!.updateProviders(mergedProviders);
       _reviewerClient!.updateSupervisorConfig(_activeConfig ?? cfg);
-      _reviewerClient!.updateFallbackModel(fallbackModel);
     }
 
     const reviewerClient = _reviewerClient!;
@@ -249,8 +226,8 @@ const plugin: PluginDefinition = {
     const consistencyChecker = _consistencyChecker!;
     const goalParser = _goalParser!;
     const summaryExtractor = _summaryExtractor!;
+    const preReviewFilter = _preReviewFilter!;
 
-    // ── Register database lifecycle service ───────────────────────
     api.registerService({
       id: 'supervisor-db',
       start() {
@@ -270,7 +247,6 @@ const plugin: PluginDefinition = {
       },
     });
 
-    // ── Register RPC methods ─────────────────────────────────────
     const registerMethod = (method: string, handler: (params: Record<string, unknown>) => Promise<unknown>) => {
       api.registerGatewayMethod(method, async (opts: {
         params: Record<string, unknown>;
@@ -287,36 +263,6 @@ const plugin: PluginDefinition = {
       });
     };
 
-    // ── Config persistence callback ────────────────────────────────
-    const configPath = path.join(process.cwd(), 'config', 'openclaw.json');
-    const persistConfig = (newCfg: SupervisorConfig): void => {
-      try {
-        if (!fs.existsSync(configPath)) return;
-        const raw = fs.readFileSync(configPath, 'utf8');
-        const ocConfig = JSON.parse(raw);
-        if (!ocConfig.plugins) ocConfig.plugins = {};
-        if (!ocConfig.plugins.entries) ocConfig.plugins.entries = {};
-        if (!ocConfig.plugins.entries['dual-model-supervisor']) {
-          ocConfig.plugins.entries['dual-model-supervisor'] = {};
-        }
-        ocConfig.plugins.entries['dual-model-supervisor'].config = {
-          enabled: newCfg.enabled,
-          supervisorModel: newCfg.supervisorModel,
-          reviewMode: newCfg.reviewMode,
-          appendReviewToChannelOutput: newCfg.appendReviewToChannelOutput,
-          memoryGuard: newCfg.memoryGuard,
-          courseCorrection: newCfg.courseCorrection,
-          highRiskTools: newCfg.highRiskTools,
-        };
-        const tmpPath = configPath + '.tmp';
-        fs.writeFileSync(tmpPath, JSON.stringify(ocConfig, null, 2) + '\n', 'utf8');
-        fs.renameSync(tmpPath, configPath);
-        api.logger.info('Supervisor config persisted to openclaw.json');
-      } catch (err) {
-        api.logger.warn(`Failed to persist supervisor config: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    };
-
     registerSupervisorRpc(
       registerMethod,
       auditLog,
@@ -331,16 +277,15 @@ const plugin: PluginDefinition = {
         consistencyChecker.updateConfig(newCfg);
         goalParser.updateConfig(newCfg);
         summaryExtractor.updateConfig(newCfg);
+        preReviewFilter.updateConfig(newCfg.preReviewFilter);
       },
       api.logger,
-      () => _sessionStates,
+      () => _registry,
       () => _extractConfiguredProviders(api.pluginConfig as Record<string, unknown> | undefined, globalCfg),
-      persistConfig,
+      () => _anchors,
     );
 
-    // ── Register hooks (guarded: only once across discovery + gateway passes) ──
-
-    if (!_hooksDone) {
+    // ── Register hooks ───────────────────────────────────────────
 
     api.on('session_start', (ctx: unknown) => {
       const c = ctx as { sessionId?: string };
@@ -349,63 +294,70 @@ const plugin: PluginDefinition = {
       }
     });
 
-    api.on('session_end', (ctx: unknown) => {
-      const c = ctx as { sessionId?: string };
-      if (typeof c.sessionId === 'string' && c.sessionId === _hookActiveSessionId) {
-        _hookActiveSessionId = null;
-      }
-    });
-
-    // before_prompt_build — inject supervisor rules + corrections + lost memory + research goal
-    api.on('before_prompt_build', () => {
+    // before_prompt_build — inject supervisor rules + session anchors + drained prepend queue + course corrections
+    api.on('before_prompt_build', (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
 
-      const activeId = _hookActiveSessionId;
-      const lastSession = activeId ? _sessionStates.get(activeId) ?? null : null;
+      const staticBlock = takeStaticSupervisorRulesBlock(activeCfg.reviewMode);
 
-      const staticBlock = takeStaticSupervisorRulesBlock(activeCfg.reviewMode, lastSession);
-
-      if (lastSession) {
-        const injection = courseCorrector.buildContextInjection(lastSession);
-
-        // P1: Inject research goal + target conclusions into the main model's context
-        const goalLines: string[] = [];
-        if (lastSession.researchGoal && lastSession.goalConfirmed) {
-          goalLines.push(`[Research Goal] ${lastSession.researchGoal}`);
-          if (lastSession.targetConclusions.length > 0) {
-            goalLines.push(`[Target Conclusions] You are expected to reach the following conclusions:`);
-            for (const target of lastSession.targetConclusions) {
-              goalLines.push(`  - ${target}`);
-            }
-          }
-          if (lastSession.methodology) {
-            goalLines.push(`[Methodology] ${lastSession.methodology}`);
-          }
-        }
-
-        if (goalLines.length > 0) {
-          const goalContext = goalLines.join('\n');
-          const existingContext = injection.prependContext ?? '';
-          const merged = [staticBlock, goalContext, existingContext].filter((s) => s.length > 0).join('\n\n');
-          return { prependContext: merged };
-        }
-
-        const rest = injection.prependContext ?? '';
-        const merged = [staticBlock, rest].filter((s) => s.length > 0).join('\n\n');
-        return merged ? { prependContext: merged } : injection;
+      const c = ctx as { sessionId?: string };
+      const sessionId = c.sessionId ?? _hookActiveSessionId ?? undefined;
+      if (!sessionId) {
+        return staticBlock.length > 0 ? { prependContext: staticBlock } : {};
       }
 
-      if (staticBlock.length > 0) {
-        return { prependContext: staticBlock };
+      let drained = _anchors.drainBlocks(sessionId);
+      const anchorView = _anchors.view(sessionId);
+
+      const turn = resolveTurn(_registry, sessionId, 'llm_input', {}, api.logger);
+
+      if (!turn && drained.length > 0) {
+        for (const b of drained) {
+          _anchors.enqueueBlock(sessionId, b);
+        }
+        drained = [];
       }
 
-      return {};
+      const injection = turn
+        ? courseCorrector.buildContextInjection(turn, drained)
+        : { prependContext: undefined as string | undefined };
+
+      const goalLines: string[] = [];
+      if (anchorView.researchGoal && anchorView.goalConfirmed) {
+        goalLines.push(`[Research Goal] ${anchorView.researchGoal}`);
+        if (anchorView.targetConclusions.length > 0) {
+          goalLines.push(`[Target Conclusions] You are expected to reach the following conclusions:`);
+          for (const target of anchorView.targetConclusions) {
+            goalLines.push(`  - ${target}`);
+          }
+        }
+        if (anchorView.methodology) {
+          goalLines.push(`[Initial Methodology] ${anchorView.methodology}`);
+        }
+        if (anchorView.methodologyDecisions.length > 0) {
+          goalLines.push(`[Established Methodology Decisions] ${anchorView.methodologyDecisions.join('; ')}`);
+        }
+        if (anchorView.userPreferences.length > 0) {
+          goalLines.push(`[User Preferences You Must Honor] ${anchorView.userPreferences.join('; ')}`);
+        }
+        if (anchorView.keyConclusions.length > 0) {
+          goalLines.push(`[Key Conclusions Reached] ${anchorView.keyConclusions.join('; ')}`);
+        }
+      }
+
+      const goalContext = goalLines.length > 0 ? goalLines.join('\n') : '';
+      const existingContext = injection.prependContext ?? '';
+      const merged = [staticBlock, goalContext, existingContext].filter((s) => s.length > 0).join('\n\n');
+      return merged ? { prependContext: merged } : {};
     });
 
-    // message_received — track session and parse research goal via reviewer model
+    // message_received — create a fresh TurnState for this message and bind
+    // it to the async chain via AsyncLocalStorage. Run pre-review filter,
+    // gatekeeper, and goal parser against the per-turn state captured in the
+    // closure.
     api.on('message_received', (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
@@ -414,39 +366,111 @@ const plugin: PluginDefinition = {
 
       const context = ctx as { sessionId?: string; message?: string };
       const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
-      if (sessionId) {
-        const state = getOrCreateSession(sessionId);
-        // P0: Use GoalParser instead of naive truncation
-        if (!state.researchGoal && context.message && context.message.length > 10) {
-          goalParser.parseGoal(context.message, sessionId, state);
+      if (!sessionId) return {};
+
+      const message = context.message ?? '';
+      const turn = _registry.create(sessionId, message);
+      // Bind this turn into AsyncLocalStorage. Subsequent synchronous and
+      // awaited hook handlers in the same async chain will pick it up.
+      turnStore.enterWith(turn);
+
+      api.logger.info(
+        `[DIAG] message_received: created turn ${turn.turnId} for session ${sessionId} (messageLen=${message.length})`,
+      );
+
+      if (message.length > 0) {
+        const localResult = preReviewFilter.shouldReview(message);
+
+        if (localResult.decision === 'skip') {
+          turn.trivialTurn = true;
+          api.logger.info(`[PreReviewFilter] Layer1 SKIP: ${localResult.reason}`);
+          auditLog.record({
+            sessionId,
+            type: 'output_review',
+            action: 'info',
+            details: `pre_review_filter_skip: ${localResult.reason}`,
+            timestamp: Date.now(),
+          });
+          return {};
         }
+
+        const truncatedMessage = message.slice(0, activeCfg.preReviewFilter.gatekeeperMaxInputChars);
+        reviewerClient.review<GatekeeperResult>(GATEKEEPER_SYSTEM_PROMPT, truncatedMessage)
+          .then((gateResult) => {
+            if (turn.phase === 'sent') {
+              api.logger.warn(`[PreReviewFilter] Gatekeeper callback: turn ${turn.turnId} already finished, skipping.`);
+              return;
+            }
+            if (gateResult && !gateResult.needReview) {
+              turn.trivialTurn = true;
+              api.logger.info(`[PreReviewFilter] Layer2 SKIP (gatekeeper): ${gateResult.reason}`);
+              auditLog.record({
+                sessionId,
+                type: 'output_review',
+                action: 'info',
+                details: `gatekeeper_skip: ${gateResult.reason}`,
+                timestamp: Date.now(),
+              });
+            } else {
+              api.logger.info(`[PreReviewFilter] Layer2 PASS (gatekeeper): ${gateResult?.reason ?? 'no result'}`);
+              goalParser.parseGoal(message, turn, _anchors);
+            }
+          })
+          .catch((err) => {
+            api.logger.error(`[PreReviewFilter] Gatekeeper failed: ${err instanceof Error ? err.message : String(err)}`);
+            if (turn.phase !== 'sent') {
+              goalParser.parseGoal(message, turn, _anchors);
+            }
+          });
+        return {};
       }
 
       return {};
     });
 
-    // llm_input — consistency check + inject corrective system message
+    // llm_input — consistency check + enqueue correction via PendingBlock
     api.on('llm_input', async (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
-        return {};
+        return;
+      }
+
+      const messages = extractLlmInputMessages(ctx);
+      if (!messages || messages.length === 0) {
+        return;
       }
 
       const context = ctx as { sessionId?: string };
-      const messages = extractLlmInputMessages(ctx);
-      if (!messages || messages.length === 0) {
-        return {};
+      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
+
+      const turn = resolveTurn(
+        _registry,
+        sessionId,
+        'llm_input',
+        { userMessage: extractLastUserMessageText(messages) },
+        api.logger,
+      );
+      if (!turn) {
+        api.logger.warn(`[DIAG] llm_input: no active turn for session ${sessionId ?? '(none)'}`);
+        return;
+      }
+      _registry.advancePhase(turn, 'llm_input');
+
+      if (turn.trivialTurn) {
+        api.logger.info(`[DIAG] llm_input: Trivial turn ${turn.turnId} — skipping consistency check`);
+        return;
       }
 
-      const sessionId = context.sessionId ?? _hookActiveSessionId ?? 'default';
-      const state = getOrCreateSession(sessionId);
-
-      return consistencyChecker.checkConsistency(messages, sessionId, state);
+      const sid = sessionId ?? turn.sessionId;
+      const result = await consistencyChecker.checkConsistency(messages, turn, _anchors.view(sid), _anchors);
+      if (result.correctionText) {
+        _anchors.enqueueBlock(sid, { type: 'consistencyCorrection', text: result.correctionText });
+      }
     });
 
-    // llm_output — record raw output, extract structured summary, run course correction.
-    // Also triggers output review and caches the result in session state,
-    // so `before_message_write` / `message_sending` can attach the review footer.
+    // llm_output — record raw output, extract structured summary, run course
+    // correction and output review. All async work captures the exact turn in
+    // its closure with a stale-turn guard.
     api.on('llm_output', (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
@@ -457,45 +481,73 @@ const plugin: PluginDefinition = {
       const outputText = extractLlmOutputText(context);
       const sessionId = (context.sessionId as string | undefined) ?? _hookActiveSessionId ?? undefined;
 
+      if (sessionId && sessionId !== _hookActiveSessionId) {
+        _hookActiveSessionId = sessionId;
+      }
+
+      api.logger.info(`[DIAG] llm_output ENTERED. sessionId=${sessionId}, hasOutputText=${!!outputText}, outputLen=${outputText?.length ?? 0}, ctxKeys=${Object.keys(context).join(',')}`);
+
       if (!sessionId || !outputText) {
+        api.logger.info(`[DIAG] llm_output EARLY EXIT. sessionId=${sessionId}, hasOutputText=${!!outputText}`);
         return;
       }
 
+      const turn = resolveTurn(_registry, sessionId, 'llm_output', {}, api.logger);
+      if (!turn) {
+        api.logger.warn(`[DIAG] llm_output: no active turn for session ${sessionId}`);
+        return;
+      }
+      _registry.advancePhase(turn, 'llm_output');
+
       try {
-        const state = getOrCreateSession(sessionId);
-        state.lastLlmOutput = outputText;
-        summaryExtractor.extractSummary(outputText, sessionId, state);
-        if (isCourseCorrectionActive(activeCfg)) {
-          courseCorrector.analyzeSession(sessionId, state);
+        turn.turnLlmOutput = outputText;
+
+        if (turn.trivialTurn) {
+          api.logger.info(`[DIAG] llm_output: Trivial turn ${turn.turnId} — skipping summary/review/course-correction`);
+          return;
         }
 
-        // Trigger output review and cache the channel footer for message_sending
-        // Review always runs (to record results for Dashboard panel), footer only when channel delivery is enabled
+        summaryExtractor.extractSummary(outputText, turn);
+        if (isCourseCorrectionActive(activeCfg)) {
+          courseCorrector.analyzeSession(turn, _anchors.view(sessionId), _anchors);
+        }
+
         if (!outputText.includes(SUPERVISOR_REVIEW_SUMMARY_MARKER)) {
           const shouldAttachToChannel = activeCfg.appendReviewToChannelOutput;
-          outputReviewer.reviewMessageSending(outputText, sessionId, state, {
+          api.logger.info(`[DIAG] llm_output: Starting ASYNC review for turn ${turn.turnId}. shouldAttachToChannel=${shouldAttachToChannel}`);
+          const reviewStartTime = Date.now();
+          outputReviewer.reviewMessageSending(outputText, turn, _anchors.view(sessionId), _anchors, {
             attachSummary: shouldAttachToChannel,
           }).then((modified) => {
+            const elapsed = Date.now() - reviewStartTime;
+            if (turn.phase === 'sent') {
+              api.logger.warn(`[DIAG] llm_output: ASYNC review completed after turn ${turn.turnId} was finalized — discarding.`);
+              return;
+            }
             if (modified !== null) {
-              // Cache for channel delivery in message_sending hook
-              state.pendingChannelReviewFooter = modified;
+              turn.pendingChannelReviewFooter = modified;
+              api.logger.info(`[DIAG] llm_output: ASYNC review COMPLETED in ${elapsed}ms. Channel footer cached (${modified.length} chars)`);
+            } else {
+              api.logger.info(`[DIAG] llm_output: ASYNC review returned null in ${elapsed}ms.`);
             }
           }).catch((err) => {
-            api.logger.error(`[Supervisor] llm_output async review failed: ${err instanceof Error ? err.message : String(err)}`);
+            api.logger.error(`[DIAG] llm_output: ASYNC review FAILED: ${err instanceof Error ? err.message : String(err)}`);
           });
         }
       } catch (err) {
-        api.logger.error(`[Supervisor] llm_output error: ${err instanceof Error ? err.message : String(err)}`);
+        api.logger.error(
+          `[DIAG] llm_output SYNC error: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
+      api.logger.info(`[DIAG] llm_output EXITING (sync portion done)`);
     });
 
-    // message_sending — append review footer ONLY when delivering through external channels.
-    // Dashboard users see review results in the Supervisor panel instead.
-    // When delivering to Telegram/WeChat/Discord, the review footer is appended so
-    // users who interact through IM channels receive the audit report directly.
+    // message_sending — for channel delivery, attach review footer (cached or
+    // live) then finalize the turn.
     api.on('message_sending', async (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       const context = ctx as { sessionId?: string; message?: string };
+      api.logger.info(`[DIAG] message_sending ENTERED. enabled=${activeCfg.enabled}, reviewMode=${activeCfg.reviewMode}, hasMessage=${!!context.message}, messageLen=${context.message?.length ?? 0}, sessionId=${context.sessionId ?? '(none)'}`);
 
       if (!isSupervisorActive(activeCfg)) {
         return {};
@@ -506,84 +558,83 @@ const plugin: PluginDefinition = {
       }
 
       const snap = snapshotMessageSendingCtx(ctx);
-
-      // Check if this is a channel delivery (Telegram/WeChat/Discord etc.)
-      // Only append review footer when delivering through external channels
       const isChannelDelivery = snap.isChannelDelivery;
+      api.logger.info(`[DIAG] message_sending: isChannelDelivery=${isChannelDelivery}, channel=${JSON.stringify(snap.flags.channel)}, source=${JSON.stringify(snap.flags.source)}`);
 
       if (snap.deferReview) {
+        api.logger.info(`[DIAG] message_sending: deferReview=true, returning {}`);
         return {};
       }
 
-      const sessionId = context.sessionId ?? _hookActiveSessionId ?? 'default';
-      const state = getOrCreateSession(sessionId);
+      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
+      const turn = resolveTurn(_registry, sessionId, 'sending', {}, api.logger);
+      if (!turn) {
+        api.logger.warn(`[DIAG] message_sending: no active turn for session ${sessionId ?? '(none)'}; passing through`);
+        return {};
+      }
+      _registry.advancePhase(turn, 'sending');
 
-      // Only attach review footer when delivering through external channels
-      if (!isChannelDelivery) {
-        // Clear any cached footer to prevent stale data
-        if (state.pendingChannelReviewFooter) {
-          state.pendingChannelReviewFooter = undefined;
+      try {
+        if (!isChannelDelivery) {
+          api.logger.info(`[DIAG] message_sending: Not a channel delivery — skipping footer append.`);
+          if (turn.pendingChannelReviewFooter) {
+            api.logger.info(`[DIAG] message_sending: Clearing cached channel footer (${turn.pendingChannelReviewFooter.length} chars)`);
+            turn.pendingChannelReviewFooter = undefined;
+          }
+          return {};
         }
+
+        if (turn.pendingChannelReviewFooter) {
+          const footer = turn.pendingChannelReviewFooter;
+          turn.pendingChannelReviewFooter = undefined;
+          api.logger.info(`[DIAG] message_sending: Found CACHED channel footer (${footer.length} chars), returning it`);
+          return { message: footer };
+        }
+
+        if (!activeCfg.appendReviewToChannelOutput) {
+          api.logger.info(`[DIAG] message_sending: appendReviewToChannelOutput=false, skipping footer`);
+          return {};
+        }
+
+        api.logger.info(`[DIAG] message_sending: No cached footer, performing LIVE review for turn ${turn.turnId}`);
+        const reviewStartTime = Date.now();
+        const modified = await outputReviewer.reviewMessageSending(
+          context.message,
+          turn,
+          sessionId ? _anchors.view(sessionId) : undefined,
+          sessionId ? _anchors : undefined,
+          { attachSummary: true },
+        );
+        const elapsed = Date.now() - reviewStartTime;
+
+        if (modified !== null) {
+          api.logger.info(`[DIAG] message_sending: LIVE review completed in ${elapsed}ms, returning modified (${modified.length} chars)`);
+          return { message: modified };
+        }
+
+        api.logger.info(`[DIAG] message_sending: LIVE review returned null in ${elapsed}ms.`);
         return {};
+      } finally {
+        if (sessionId) {
+          _anchors.merge(sessionId, turn.stagedAnchorUpdates);
+        }
+        turn.stagedAnchorUpdates = {};
+        _registry.finish(turn);
+        api.logger.info(`[DIAG] message_sending: finalized turn ${turn.turnId}`);
       }
-
-      // Channel delivery — check for cached footer first
-      if (state.pendingChannelReviewFooter) {
-        const footer = state.pendingChannelReviewFooter;
-        state.pendingChannelReviewFooter = undefined;
-        return { message: footer };
-      }
-
-      // No cached footer — perform live review with footer for channel
-      if (!activeCfg.appendReviewToChannelOutput) {
-        return {};
-      }
-
-      const modified = await outputReviewer.reviewMessageSending(context.message, sessionId, state, {
-        attachSummary: true,
-      });
-
-      if (modified !== null) {
-        return { message: modified };
-      }
-
-      return {};
     });
 
-    // before_message_write — synchronously prepare session state for the review
-    // that will be completed asynchronously by the llm_output hook.
-    // NOTE: The gateway treats this hook as SYNCHRONOUS — returning a Promise
-    // (via `async`) causes the result to be silently ignored. All actual review
-    // logic lives in `llm_output` which correctly supports async handlers.
-    api.on('before_message_write', (ctx: unknown) => {
+    // before_message_write — sync hook; we don't modify the message here.
+    // Review is driven asynchronously from `llm_output`.
+    api.on('before_message_write', () => {
       const activeCfg = _activeConfig ?? cfg;
-      const context = ctx as { sessionId?: string; message?: unknown };
-
-      const msg = context.message;
-
-      // Resolve sessionId: context.sessionId → _hookActiveSessionId → extract from message
-      let sessionId = context.sessionId ?? _hookActiveSessionId;
-      if (!sessionId && msg && typeof msg === 'object') {
-        const msgObj = msg as Record<string, unknown>;
-        if (typeof msgObj.sessionId === 'string') {
-          sessionId = msgObj.sessionId;
-        }
-      }
-
-      if (!sessionId) sessionId = 'default';
-
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
-
-      // Ensure session state exists so llm_output's async callback can populate it
-      getOrCreateSession(sessionId);
-
-      // Always return empty — we don't modify the message content in before_message_write
       return {};
     });
 
-    // before_tool_call — tool call review
+    // before_tool_call — tool call review (sessionId-scoped, no turn needed)
     api.on('before_tool_call', async (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
@@ -609,25 +660,28 @@ const plugin: PluginDefinition = {
       return {};
     });
 
-    // before_compaction — memory anchor injection
+    // before_compaction — capture key memory into compaction event (no turn required)
     api.on('before_compaction', async (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
 
-      const context = ctx as { sessionId?: string; messages?: Array<{ role: string; content: string }> };
+      const context = ctx as { sessionId?: string; messages?: Array<{ role: string; content: unknown }> };
       if (!context.messages) {
         return {};
       }
 
-      const sessionId = context.sessionId ?? 'default';
-      const state = getOrCreateSession(sessionId);
+      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
+      if (!sessionId) {
+        return {};
+      }
 
-      return memoryGuardian.beforeCompaction(context.messages, sessionId, state);
+      const ev = _compactions.begin(sessionId);
+      await memoryGuardian.beforeCompaction(context.messages, ev);
     });
 
-    // after_compaction — memory loss detection
+    // after_compaction — memory loss detection + anchors merge
     api.on('after_compaction', async (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
@@ -636,27 +690,45 @@ const plugin: PluginDefinition = {
 
       const context = ctx as {
         sessionId?: string;
-        original?: Array<{ role: string; content: string }>;
-        compacted?: Array<{ role: string; content: string }>;
+        original?: Array<{ role: string; content: unknown }>;
+        compacted?: Array<{ role: string; content: unknown }>;
       };
 
       if (!context.original || !context.compacted) {
         return;
       }
 
-      const sessionId = context.sessionId ?? 'default';
-      const state = getOrCreateSession(sessionId);
+      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
+      if (!sessionId) {
+        return;
+      }
 
-      await memoryGuardian.afterCompaction(context.original, context.compacted, sessionId, state);
+      const ev = _compactions.current(sessionId);
+      if (!ev) {
+        api.logger.warn(`[DIAG] after_compaction: no compaction event for session ${sessionId}`);
+        return;
+      }
+
+      await memoryGuardian.afterCompaction(
+        context.original,
+        context.compacted,
+        ev,
+        _anchors.view(sessionId),
+        _anchors,
+      );
+      _compactions.end(sessionId);
     });
 
-    // session_end — output regeneration summary and cleanup session state
+    // session_end — emit regeneration summaries for any still-active turns,
+    // then drop the entire session from the registry.
     api.on('session_end', (ctx: unknown) => {
       const context = ctx as { sessionId?: string };
-      if (context.sessionId) {
-        const state = _sessionStates.get(context.sessionId);
-        if (state && state.regenerateHistory.length > 0) {
-          const summary = courseCorrector.buildRegenerationSummary(state);
+      if (!context.sessionId) return;
+
+      const activeTurns = _registry.listActive(context.sessionId);
+      for (const turn of activeTurns) {
+        if (turn.regenerateHistory.length > 0) {
+          const summary = courseCorrector.buildRegenerationSummary(turn);
           if (summary) {
             auditLog.record({
               sessionId: context.sessionId,
@@ -665,19 +737,25 @@ const plugin: PluginDefinition = {
               details: summary,
               timestamp: Date.now(),
             });
-            api.logger.info(`[Supervisor] Session ${context.sessionId} regeneration summary: ${state.regenerateAttempts} attempt(s)`);
+            api.logger.info(`[Supervisor] Turn ${turn.turnId} regeneration summary: ${turn.regenerateHistory.length} attempt(s)`);
           }
         }
-        _sessionStates.delete(context.sessionId);
+        _registry.finish(turn);
+      }
+      _registry.dropSession(context.sessionId);
+      _anchors.drop(context.sessionId);
+      _compactions.dropAll(context.sessionId);
+      if (context.sessionId === _hookActiveSessionId) {
+        _hookActiveSessionId = null;
       }
     });
-
-    _hooksDone = true;
-    } // end _hooksDone guard
 
     api.logger.info('Dual Model Supervisor registered (7 hooks + 6 RPC methods)');
   },
 };
+
+// Expose a shape so RPC can surface both per-session and per-turn info.
+export type { TurnState };
 
 /**
  * Merge provider maps: root `config.models.providers` (OpenClaw global) + plugin entry overrides.
@@ -708,10 +786,6 @@ function _extractProviders(
   return { ...fromGlobal };
 }
 
-/**
- * Extract configured provider list for RPC response.
- * Reads from models.providers in the openclaw config.
- */
 function _extractConfiguredProviders(
   pluginConfig?: Record<string, unknown>,
   globalConfig?: Record<string, unknown>,
@@ -723,7 +797,7 @@ function _extractConfiguredProviders(
     if (!cfg.baseUrl) continue;
     result.push({
       key,
-      label: key, // Front-end will map to preset label
+      label: key,
       hasApiKey: Boolean(cfg.apiKey),
       models: (cfg.models ?? []).map((m) => ({ id: m.id, name: m.name ?? m.id })),
       baseUrl: cfg.baseUrl,

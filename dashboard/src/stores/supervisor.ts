@@ -14,11 +14,39 @@ export interface SupervisorStats {
   warnings: number;
 }
 
+export type TurnPhase = 'received' | 'llm_input' | 'llm_output' | 'sending' | 'sent';
+
+export interface TurnSummary {
+  turnId: string;
+  turnSeq: number;
+  phase: TurnPhase;
+  createdAt: number;
+  researchGoal?: string;
+  targetConclusions: string[];
+  goalConfirmed: boolean;
+  regenerateAttempts: number;
+  trivialTurn: boolean;
+  lastReviewReport?: string;
+}
+
+/** Session-level anchors (merged on send); mirrors plugin `SessionAnchorsRpc`. */
+export interface SessionAnchorsInfo {
+  researchGoal?: string;
+  goalConfirmed: boolean;
+  methodology?: string;
+  targetConclusions: string[];
+  keyConclusions: string[];
+  userPreferences: string[];
+  methodologyDecisions: string[];
+}
+
 export interface SessionInfo {
   sessionId: string;
   researchGoal?: string;
   targetConclusions: string[];
   goalConfirmed: boolean;
+  anchors: SessionAnchorsInfo;
+  activeTurns: TurnSummary[];
 }
 
 export interface SupervisorStatus {
@@ -28,9 +56,9 @@ export interface SupervisorStatus {
   appendReviewToChannelOutput: boolean;
   memoryGuardEnabled: boolean;
   courseCorrectionEnabled: boolean;
-  deviationThreshold: number;
-  forceRegenerate: boolean;
-  maxRegenerateAttempts: number;
+    deviationThreshold: number;
+    forceRegenerate: boolean;
+    maxRegenerateAttempts: number;
   highRiskTools: string[];
   stats: SupervisorStats;
   activeSessions: number;

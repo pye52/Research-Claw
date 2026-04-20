@@ -22,6 +22,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): Superviso
       : DEFAULT_CONFIG.appendReviewToChannelOutput,
     memoryGuard: parseMemoryGuard(raw.memoryGuard),
     courseCorrection: parseCourseCorrection(raw.courseCorrection),
+    preReviewFilter: parsePreReviewFilter(raw.preReviewFilter),
     highRiskTools: parseStringArray(raw.highRiskTools, DEFAULT_CONFIG.highRiskTools),
   };
 }
@@ -54,6 +55,21 @@ function parseCourseCorrection(raw: unknown): SupervisorConfig['courseCorrection
     maxRegenerateAttempts: typeof obj.maxRegenerateAttempts === 'number'
       ? Math.max(1, Math.round(obj.maxRegenerateAttempts))
       : DEFAULT_CONFIG.courseCorrection.maxRegenerateAttempts,
+  };
+}
+
+/** Parse preReviewFilter sub-config; clamps minContentLength to ≥1 and gatekeeperMaxInputChars to ≥50. */
+function parsePreReviewFilter(raw: unknown): SupervisorConfig['preReviewFilter'] {
+  if (typeof raw !== 'object' || raw === null) return { ...DEFAULT_CONFIG.preReviewFilter };
+  const obj = raw as Record<string, unknown>;
+  return {
+    minContentLength: typeof obj.minContentLength === 'number'
+      ? Math.max(1, Math.round(obj.minContentLength))
+      : DEFAULT_CONFIG.preReviewFilter.minContentLength,
+    gatekeeperMaxInputChars: typeof obj.gatekeeperMaxInputChars === 'number'
+      ? Math.max(50, Math.round(obj.gatekeeperMaxInputChars))
+      : DEFAULT_CONFIG.preReviewFilter.gatekeeperMaxInputChars,
+    alwaysReviewToolCalls: typeof obj.alwaysReviewToolCalls === 'boolean' ? obj.alwaysReviewToolCalls : DEFAULT_CONFIG.preReviewFilter.alwaysReviewToolCalls,
   };
 }
 

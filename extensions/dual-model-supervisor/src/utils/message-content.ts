@@ -66,5 +66,5 @@ export function messageContentToPlainText(content: unknown): string {
 export function truncateMessagePlainText(content: unknown, maxChars: number): string {
   const s = messageContentToPlainText(content);
   if (s.length <= maxChars) return s;
-  return s.slice(0, maxChars);
+  return s.slice(0, maxChars) + '…[truncated]';
 }

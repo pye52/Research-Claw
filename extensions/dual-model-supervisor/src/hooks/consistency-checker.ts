@@ -1,19 +1,57 @@
 /**
- * Dual Model Supervisor — Consistency Checker (llm_input hook)
+ * Dual Model Supervisor — ConsistencyChecker (`llm_input` hook)
  *
- * Checks conversation consistency before sending to the main LLM.
- * Can inject corrective system messages when inconsistencies are detected.
+ * Responsibilities (two parallel sub-checks)
+ *  1. **Recent conversation consistency** (`CONSISTENCY_CHECK_SYSTEM_PROMPT`): before the main LLM
+ *     actually receives the messages, compare the last ~10 messages against anchors (researchGoal /
+ *     methodologyDecisions / userPreferences / keyConclusions). If internal contradictions or conflicts
+ *     with established agreements are found, **return correctionText** which the `llm_input` handler
+ *     enqueues as a `consistencyCorrection` PendingBlock. This block is drained by `before_prompt_build`
+ *     and injected as `prependContext` in the next turn.
+ *  2. **Target conclusion drift detection** (`TARGET_CONCLUSION_CHECK_PROMPT`):
+ *     Only executed when the consistency check finds no issues and anchors already contain
+ *     targetConclusions + recentSummaries. Responsible for assessing "whether recent work is still
+ *     progressing toward the target conclusions", and allows the reviewer to propose up to 2 new
+ *     targetConclusions (deduplicated + capacity capped).
+ *
+ * Design rationale
+ *  - **Separation of concerns vs course-corrector**: this class only evaluates "recent consistency
+ *    + target progress", and does not directly trigger force-regenerate. Session-level deviation
+ *    scoring / forced regeneration is the sole responsibility of CourseCorrector during the llm_output
+ *    phase, avoiding ambiguity in deviationScore definitions across two locations.
+ *  - All corrections are enqueued as PendingBlocks and drained by `before_prompt_build`.
+ *  - **Dual-mode conversation context construction** (_buildConversationContext):
+ *      • Short context (≤ SAFE_NO_TRUNCATE_LIMIT chars): fully preserved to give the reviewer maximum fidelity.
+ *      • Long context + has summaries: replace assistant messages with structured summaries via
+ *        findMatchingSummary, compressing tokens while retaining the semantic skeleton.
+ *      • Long context but missing summaries: degrade to hard truncation by character count (worst path,
+ *        still yields a conclusion).
+ *  - **suggestedNewTargets cap and deduplication**: prevents the reviewer from infinitely expanding
+ *    the target list across multiple turns; hard cap of 2 per turn + normalized deduplication +
+ *    global 15-entry FIFO.
+ *  - **Fail silently**: if the reviewer is unavailable or any exception occurs, return an empty patch
+ *    and never block the main LLM call.
  */
 
-import type { ConsistencyCheckResult, SupervisorConfig, PluginLogger, SessionState } from '../core/types.js';
+import type { ConsistencyCheckResult, SupervisorConfig, PluginLogger, TurnState } from '../core/types.js';
+import type { SessionAnchors } from '../core/session-anchors.js';
+import { SessionAnchorsRegistry } from '../core/session-anchors.js';
 import { ReviewerClient } from '../client/reviewer.js';
 import { AuditLogService } from '../core/audit-log.js';
 import { CONSISTENCY_CHECK_SYSTEM_PROMPT, TARGET_CONCLUSION_CHECK_PROMPT } from '../core/prompts.js';
 import { isCourseCorrectionActive } from '../core/config.js';
 import { messageContentToPlainText, truncateMessagePlainText } from '../utils/message-content.js';
-import { buildSessionContextLines } from '../utils/session-context.js';
+import { buildAnchorContextLines } from '../utils/anchor-context.js';
 import { findMatchingSummary } from '../utils/summary-matcher.js';
-import { validateConsistencyResult } from '../core/validators.js';
+
+
+/**
+ * When the total plain-text length of the last 10 messages does not exceed this threshold,
+ * feed the full original text to the reviewer without any truncation. 8000 characters roughly
+ * corresponds to a ~2k token input, which is safe for the vast majority of reviewer models;
+ * beyond this threshold, the structured summary / hard truncation fallback path is activated.
+ */
+const SAFE_NO_TRUNCATE_LIMIT = 8000;
 
 export class ConsistencyChecker {
   private config: SupervisorConfig;
@@ -37,35 +75,47 @@ export class ConsistencyChecker {
     this.config = config;
   }
 
+  /**
+   * Entry point: check recent conversation consistency and return correction text if necessary.
+   *
+   * Returns:
+   *  - `{}`: no consistency issues detected.
+   *  - `{ correctionText: string }`: a consistency correction should be injected into the next
+   *    `before_prompt_build` via `enqueueBlock({ type: 'consistencyCorrection', text })`.
+   *
+   * Bypass logic: when the consistency check finds no issues, it also runs _checkTargetConclusions,
+   * so the "whether we are still progressing toward the goal" assessment only happens when there is no more pressing consistency problem.
+   */
   async checkConsistency(
     messages: Array<{ role: string; content: unknown }>,
-    sessionId: string,
-    sessionState: SessionState,
-  ): Promise<{ messages?: Array<{ role: string; content: unknown }> }> {
+    turn: TurnState,
+    anchors: Readonly<SessionAnchors>,
+    registry: SessionAnchorsRegistry,
+  ): Promise<{ correctionText?: string }> {
     if (!isCourseCorrectionActive(this.config)) return {};
 
     try {
-      const conversationText = this._buildConversationContext(messages, sessionState);
-      const contextParts = buildSessionContextLines(sessionState);
+      const conversationText = this._buildConversationContext(messages, anchors);
+      const contextParts = buildAnchorContextLines(anchors);
 
-      const messagesText = contextParts.length > 0
+      // Session Context first, Recent Messages after: let the reviewer see "constraints" before "facts".
+      const userContent = contextParts.length > 0
         ? `## Session Context\n${contextParts.join('\n')}\n\n## Recent Messages\n${conversationText}`
         : conversationText;
-      const userContent = `<user_content>\n${messagesText}\n</user_content>`;
 
-      const raw = await this.reviewerClient.review<Record<string, unknown>>(
+      const result = await this.reviewerClient.review<ConsistencyCheckResult>(
         CONSISTENCY_CHECK_SYSTEM_PROMPT,
         userContent,
       );
-      const result = validateConsistencyResult(raw);
 
+      // No issue → also check targetConclusion progress, then return empty.
       if (!result || !result.hasIssue) {
-        await this._checkTargetConclusions(sessionId, sessionState);
+        await this._checkTargetConclusions(turn, anchors, registry);
         return {};
       }
 
       this.auditLog.record({
-        sessionId,
+        sessionId: turn.sessionId,
         type: 'consistency_check',
         action: 'warn',
         details: result.details.join('; '),
@@ -74,56 +124,60 @@ export class ConsistencyChecker {
       });
 
       if (result.correction) {
-        const lastUserIdx = messages.findLastIndex((m) => m.role === 'user');
-        if (lastUserIdx >= 0) {
-          const correctiveMessage = {
-            role: 'system' as const,
-            content: `[Supervisor Consistency Alert] ${result.correction}`,
-          };
-
-          const newMessages = [
-            ...messages.slice(0, lastUserIdx),
-            correctiveMessage,
-            ...messages.slice(lastUserIdx),
-          ];
-
-          return { messages: newMessages };
-        }
+        return { correctionText: result.correction };
       }
 
       return {};
     } catch (err) {
+      // Consistency check failures should be silent: never block the main LLM due to review pipeline issues.
       this.logger.error(`Consistency check failed: ${err instanceof Error ? err.message : String(err)}`);
       return {};
     }
   }
 
   /**
-   * Build a human-readable conversation context string from recent messages.
-   * When structured summaries are available, replaces raw assistant content
-   * with compact summary (claims/decisions/refs) for more efficient reviewer prompts.
+   * Build the "recent conversation" text fed to the reviewer, with three fallback tiers:
+   *  - Path A (short): full original text, no truncation — consistency judgment is sensitive to original wording, so avoid truncating when possible.
+   *  - Path B (long + no summaries): hard truncate each message to 500/800 characters — worst path, but still functional.
+   *  - Path C (long + has summaries): replace assistant messages with structured summaries, truncate user messages to 800 characters
+   *      — compresses tokens while retaining the key skeleton of claims/decisions/negations.
    */
   private _buildConversationContext(
     messages: Array<{ role: string; content: unknown }>,
-    sessionState: SessionState,
+    anchors: Readonly<SessionAnchors>,
   ): string {
     const recentMessages = messages.slice(-10);
-    const summariesAvailable = sessionState.recentSummaries.length > 0;
+    const summaries = anchors.recentSummaries;
 
-    if (!summariesAvailable) {
+    const plainTexts = recentMessages.map((m) => messageContentToPlainText(m.content));
+    const totalChars = plainTexts.reduce((sum, t) => sum + t.length, 0);
+
+    // Path A: short context, use original text.
+    if (totalChars <= SAFE_NO_TRUNCATE_LIMIT) {
       return recentMessages
-        .map((m) => `[${m.role}]: ${truncateMessagePlainText(m.content, 500)}`)
+        .map((m, i) => `[${m.role}]: ${plainTexts[i]}`)
         .join('\n\n');
     }
 
-    const parts: string[] = [];
-    const summaries = sessionState.recentSummaries;
+    // Path B: long context but missing summaries, hard truncate by character count.
+    if (summaries.length === 0) {
+      return recentMessages
+        .map((m, i) => `[${m.role}]: ${truncateMessagePlainText(plainTexts[i], 500)}`)
+        .join('\n\n');
+    }
 
-    for (const msg of recentMessages) {
+    // Path C: long context + has summaries, compress by role.
+    const parts: string[] = [];
+    for (let i = 0; i < recentMessages.length; i++) {
+      const msg = recentMessages[i];
+      const plain = plainTexts[i];
+
       if (msg.role === 'user') {
-        parts.push(`[user]: ${truncateMessagePlainText(msg.content, 800)}`);
+        // User messages retain more original text (800 chars), because reviewer needs to see the user's latest intent.
+        parts.push(`[user]: ${truncateMessagePlainText(plain, 800)}`);
       } else if (msg.role === 'assistant') {
-        const summary = findMatchingSummary(messageContentToPlainText(msg.content), summaries);
+        // Prefer structured summaries over original text; fall back to truncation if no match.
+        const summary = findMatchingSummary(plain, summaries);
         if (summary) {
           const summaryParts: string[] = [];
           if (summary.claims.length > 0) summaryParts.push(`Claims: ${summary.claims.join('; ')}`);
@@ -136,25 +190,39 @@ export class ConsistencyChecker {
           if (summary.nextSteps.length > 0) summaryParts.push(`Next: ${summary.nextSteps.join('; ')}`);
           parts.push(`[assistant]: ${summaryParts.join(' | ')}`);
         } else {
-          parts.push(`[assistant]: ${truncateMessagePlainText(msg.content, 500)}`);
+          parts.push(`[assistant]: ${truncateMessagePlainText(plain, 500)}`);
         }
       } else {
-        parts.push(`[${msg.role}]: ${truncateMessagePlainText(msg.content, 300)}`);
+        // system / tool and other roles get minimal truncation of 300 characters.
+        parts.push(`[${msg.role}]: ${truncateMessagePlainText(plain, 300)}`);
       }
     }
 
     return parts.join('\n\n');
   }
 
+  /**
+   * Sub-check: target conclusion drift.
+   *
+   * Only executed when both prerequisites are met:
+   *  - targetConclusions already exist (otherwise there is no "target" to compare against);
+   *  - recentSummaries are available (otherwise there is no "recent work" to measure).
+   *
+   * Output handling:
+   *  - driftDetected: stuff the correction description into a driftCorrection block, to be consumed by course-corrector
+   *    during the before_prompt_build phase.
+   *  - suggestedNewTargets: hard cap of 2 entries + normalized deduplication + global 15-entry FIFO.
+   */
   private async _checkTargetConclusions(
-    sessionId: string,
-    sessionState: SessionState,
+    turn: TurnState,
+    anchors: Readonly<SessionAnchors>,
+    registry: SessionAnchorsRegistry,
   ): Promise<void> {
-    if (sessionState.targetConclusions.length === 0) return;
-    if (sessionState.recentSummaries.length === 0) return;
+    if (anchors.targetConclusions.length === 0) return;
+    if (anchors.recentSummaries.length === 0) return;
 
     try {
-      const recentWorkSummary = sessionState.recentSummaries
+      const recentWorkSummary = anchors.recentSummaries
         .slice(-5)
         .map((s) => {
           const parts: string[] = [];
@@ -169,13 +237,16 @@ export class ConsistencyChecker {
         .join('\n');
 
       const contextParts: string[] = [];
-      if (sessionState.researchGoal) {
-        contextParts.push(`Research goal: ${sessionState.researchGoal}`);
+      if (anchors.researchGoal) {
+        contextParts.push(`Research goal: ${anchors.researchGoal}`);
       }
-      contextParts.push(`Target conclusions: ${sessionState.targetConclusions.join('\n- ')}`);
+      contextParts.push(`Target conclusions: ${anchors.targetConclusions.join('\n- ')}`);
+      if (anchors.methodologyDecisions.length > 0) {
+        contextParts.push(`Established methodology decisions: ${anchors.methodologyDecisions.join('; ')}`);
+      }
       contextParts.push(`Recent work:\n${recentWorkSummary}`);
 
-      const userContent = `<user_content>\n${contextParts.join('\n\n')}\n</user_content>`;
+      const userContent = contextParts.join('\n\n');
 
       const result = await this.reviewerClient.review<{
         progressAssessment: string;
@@ -189,7 +260,7 @@ export class ConsistencyChecker {
       if (!result) return;
 
       this.auditLog.record({
-        sessionId,
+        sessionId: turn.sessionId,
         type: 'consistency_check',
         action: result.driftDetected ? 'warn' : 'info',
         details: result.progressAssessment,
@@ -198,18 +269,32 @@ export class ConsistencyChecker {
       });
 
       if (result.driftDetected && result.driftDetails) {
-        sessionState.pendingCourseCorrection =
+        const text =
           `Possible drift from target conclusions. ${result.driftDetails}. Unaddressed targets: ${result.unaddressedTargets.join('; ')}`;
+        registry.enqueueBlock(turn.sessionId, { type: 'driftCorrection', text });
       }
 
+      // suggestedNewTargets triple protection:
+      //  1) At most 2 new entries per turn (capNew) — prevents the reviewer from repeatedly "suggesting new targets" and infinitely expanding the list;
+      //  2) trim+lowercase normalized deduplication — avoids duplicate entries caused by case/space differences;
+      //  3) Global FIFO cap of 15 entries — controls anchor size, older entries naturally fall out.
       if (result.suggestedNewTargets && result.suggestedNewTargets.length > 0) {
+        const staged = turn.stagedAnchorUpdates;
+        if (!staged.targetConclusions) staged.targetConclusions = [];
+        const normKey = (s: string) => s.trim().toLowerCase();
+        const existing = new Set(staged.targetConclusions.map(normKey));
+        const capNew = 2;
+        let added = 0;
         for (const target of result.suggestedNewTargets) {
-          if (!sessionState.targetConclusions.includes(target)) {
-            sessionState.targetConclusions.push(target);
-          }
+          if (added >= capNew) break;
+          const n = normKey(target);
+          if (!n || existing.has(n)) continue;
+          existing.add(n);
+          staged.targetConclusions.push(target);
+          added += 1;
         }
-        if (sessionState.targetConclusions.length > 15) {
-          sessionState.targetConclusions = sessionState.targetConclusions.slice(-15);
+        if (staged.targetConclusions.length > 15) {
+          staged.targetConclusions = staged.targetConclusions.slice(-15);
         }
       }
     } catch (err) {

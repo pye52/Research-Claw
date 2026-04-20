@@ -7,16 +7,13 @@
 
 import type { MessageSummary } from '../core/types.js';
 
-const SNIPPET_LENGTH = 50;
-const MIN_SNIPPET_LENGTH = 10;
-
 /**
- * Check whether any text in the given array produces a snippet that appears in `content`.
+ * Check whether any text in the given array appears as a substring in `content`.
+ * Uses full text — no truncation — to avoid mis-matching on coincidental overlaps.
  */
 function anySnippetMatches(content: string, texts: string[]): boolean {
   for (const text of texts) {
-    const snippet = text.slice(0, SNIPPET_LENGTH);
-    if (snippet.length > MIN_SNIPPET_LENGTH && content.includes(snippet)) {
+    if (text.length > 0 && content.includes(text)) {
       return true;
     }
   }
