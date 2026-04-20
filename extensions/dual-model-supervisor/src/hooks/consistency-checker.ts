@@ -33,7 +33,7 @@
  *    and never block the main LLM call.
  */
 
-import type { ConsistencyCheckResult, SupervisorConfig, PluginLogger, TurnState } from '../core/types.js';
+import type { SupervisorConfig, PluginLogger, TurnState } from '../core/types.js';
 import type { SessionAnchors } from '../core/session-anchors.js';
 import { SessionAnchorsRegistry } from '../core/session-anchors.js';
 import { ReviewerClient } from '../client/reviewer.js';
@@ -43,6 +43,7 @@ import { isCourseCorrectionActive } from '../core/config.js';
 import { messageContentToPlainText, truncateMessagePlainText } from '../utils/message-content.js';
 import { buildAnchorContextLines } from '../utils/anchor-context.js';
 import { findMatchingSummary } from '../utils/summary-matcher.js';
+import { validateConsistencyResult, validateTargetConclusionCheck } from '../core/validators.js';
 
 
 /**
@@ -99,14 +100,16 @@ export class ConsistencyChecker {
       const contextParts = buildAnchorContextLines(anchors);
 
       // Session Context first, Recent Messages after: let the reviewer see "constraints" before "facts".
-      const userContent = contextParts.length > 0
+      const rawContent = contextParts.length > 0
         ? `## Session Context\n${contextParts.join('\n')}\n\n## Recent Messages\n${conversationText}`
         : conversationText;
+      const userContent = `<user_content>\n${rawContent}\n</user_content>`;
 
-      const result = await this.reviewerClient.review<ConsistencyCheckResult>(
+      const raw = await this.reviewerClient.review<Record<string, unknown>>(
         CONSISTENCY_CHECK_SYSTEM_PROMPT,
         userContent,
       );
+      const result = validateConsistencyResult(raw);
 
       // No issue → also check targetConclusion progress, then return empty.
       if (!result || !result.hasIssue) {
@@ -246,16 +249,14 @@ export class ConsistencyChecker {
       }
       contextParts.push(`Recent work:\n${recentWorkSummary}`);
 
-      const userContent = contextParts.join('\n\n');
+      const rawContent = contextParts.join('\n\n');
+      const userContent = `<user_content>\n${rawContent}\n</user_content>`;
 
-      const result = await this.reviewerClient.review<{
-        progressAssessment: string;
-        addressedTargets: string[];
-        unaddressedTargets: string[];
-        driftDetected: boolean;
-        driftDetails: string;
-        suggestedNewTargets: string[];
-      }>(TARGET_CONCLUSION_CHECK_PROMPT, userContent);
+      const raw = await this.reviewerClient.review<Record<string, unknown>>(
+        TARGET_CONCLUSION_CHECK_PROMPT,
+        userContent,
+      );
+      const result = validateTargetConclusionCheck(raw);
 
       if (!result) return;
 

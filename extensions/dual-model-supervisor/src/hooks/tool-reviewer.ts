@@ -24,11 +24,12 @@
  *    legitimate user tool calls.
  */
 
-import type { ToolReviewResult, SupervisorConfig, PluginLogger } from '../core/types.js';
+import type { SupervisorConfig, PluginLogger } from '../core/types.js';
 import { ReviewerClient } from '../client/reviewer.js';
 import { QuickChecker } from './quick-checker.js';
 import { AuditLogService } from '../core/audit-log.js';
 import { TOOL_REVIEW_SYSTEM_PROMPT } from '../core/prompts.js';
+import { validateToolReviewResult } from '../core/validators.js';
 
 export class ToolReviewer {
   private config: SupervisorConfig;
@@ -103,11 +104,13 @@ export class ToolReviewer {
     }
 
     // ── Stage 2: Reviewer deep review for high-risk tools ──────────
-    const userContent = `## Tool Call\nTool: ${tool}\nParameters: ${JSON.stringify(params, null, 2)}`;
-    const result = await this.reviewerClient.review<ToolReviewResult>(
+    const rawContent = `## Tool Call\nTool: ${tool}\nParameters: ${JSON.stringify(params, null, 2)}`;
+    const userContent = `<user_content>\n${rawContent}\n</user_content>`;
+    const raw = await this.reviewerClient.review<Record<string, unknown>>(
       TOOL_REVIEW_SYSTEM_PROMPT,
       userContent,
     );
+    const result = validateToolReviewResult(raw, Object.keys(params));
 
     // Failure policy: reviewer unavailable = pass. Review pipeline failures should not block legitimate calls.
     if (!result) {

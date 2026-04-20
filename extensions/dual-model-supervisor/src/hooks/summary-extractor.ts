@@ -33,6 +33,7 @@ import { AuditLogService } from '../core/audit-log.js';
 import { SUMMARY_EXTRACTION_SYSTEM_PROMPT } from '../core/prompts.js';
 import { isSupervisorActive } from '../core/config.js';
 import { ANCHOR_CAPS } from '../core/session-anchors.js';
+import { validateMessageSummary } from '../core/validators.js';
 
 /**
  * When the reviewer does not provide decisionKinds, this regex serves as the fallback
@@ -84,10 +85,12 @@ export class SummaryExtractor {
 
   private async _doExtract(output: string, turn: TurnState): Promise<void> {
     try {
-      const result = await this.reviewerClient.review<MessageSummary>(
+      const userContent = `<user_content>\n${output}\n</user_content>`;
+      const raw = await this.reviewerClient.review<Record<string, unknown>>(
         SUMMARY_EXTRACTION_SYSTEM_PROMPT,
-        output,
+        userContent,
       );
+      const result = validateMessageSummary(raw);
 
       // Async race condition: this turn has already been sent / finished, skip writing to staging
       // (avoid polluting the next turn's anchor merge).

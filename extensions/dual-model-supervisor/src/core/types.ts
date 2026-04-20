@@ -211,6 +211,9 @@ export interface TurnState {
   pendingChannelReviewFooter?: string; // Cached footer for channel delivery
   lastReviewReport?: string;       // Human-readable review report (Dashboard display)
   trivialTurn?: boolean;           // Pre-review filter verdict for this turn
+
+  /** Static supervisor rules already injected in this turn (prevents duplicate injection). */
+  staticRulesInjected?: boolean;
 }
 
 // ── models.providers.* (aligned with Dashboard GatewayModelDef / openclaw.json) ──

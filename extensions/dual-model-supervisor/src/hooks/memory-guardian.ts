@@ -25,7 +25,7 @@
  *    reviewer-friendly.
  */
 
-import type { MemoryItem, MemoryLossItem, SupervisorConfig, PluginLogger } from '../core/types.js';
+import type { SupervisorConfig, PluginLogger } from '../core/types.js';
 import type { CompactionEventState } from '../core/compaction-event.js';
 import type { SessionAnchors } from '../core/session-anchors.js';
 import { SessionAnchorsRegistry } from '../core/session-anchors.js';
@@ -35,6 +35,7 @@ import { KEY_MEMORY_IDENTIFICATION_PROMPT, MEMORY_LOSS_DETECTION_PROMPT } from '
 import { isMemoryGuardActive } from '../core/config.js';
 import { messageContentToPlainText, truncateMessagePlainText } from '../utils/message-content.js';
 import { findMatchingSummary } from '../utils/summary-matcher.js';
+import { validateKeyMemoryItems, validateMemoryLossItems } from '../core/validators.js';
 
 export class MemoryGuardian {
   private config: SupervisorConfig;
@@ -75,12 +76,13 @@ export class MemoryGuardian {
         .map((m) => `[${m.role}]: ${truncateMessagePlainText(m.content, 12_000)}`)
         .join('\n\n');
 
-      const result = await this.reviewerClient.review<{ keyItems: MemoryItem[] }>(
+      const userContent = `<user_content>\n${conversationText}\n</user_content>`;
+      const raw = await this.reviewerClient.review<Record<string, unknown>>(
         KEY_MEMORY_IDENTIFICATION_PROMPT,
-        conversationText,
+        userContent,
       );
 
-      const keyItems = result?.keyItems ?? [];
+      const keyItems = validateKeyMemoryItems(raw);
       event.preCompactionMemory = keyItems;
 
       if (keyItems.length > 0) {
@@ -169,16 +171,17 @@ export class MemoryGuardian {
           .join('\n');
       }
 
-      const userContent =
+      const rawContent =
         preCompactionChecklist +
         `## Original Messages\n${originalText}\n\n## Compacted Messages\n${compactedText}`;
+      const userContent = `<user_content>\n${rawContent}\n</user_content>`;
 
-      const result = await this.reviewerClient.review<{ lostItems: MemoryLossItem[] }>(
+      const raw = await this.reviewerClient.review<Record<string, unknown>>(
         MEMORY_LOSS_DETECTION_PROMPT,
         userContent,
       );
 
-      const lostItems = result?.lostItems ?? [];
+      const lostItems = validateMemoryLossItems(raw);
 
       // Only push critical/high lost items into next turn's prepend; medium items are already prohibited at the prompt stage,
       // this adds an extra filter to avoid noise bothering the user.

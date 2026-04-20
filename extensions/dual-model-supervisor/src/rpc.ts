@@ -10,7 +10,7 @@ import type {
   TurnState,
   TurnPhase,
 } from './core/types.js';
-import { DEFAULT_CONFIG } from './core/types.js';
+import { AuditLogType, DEFAULT_CONFIG } from './core/types.js';
 import type { TurnRegistry } from './core/turn-context.js';
 import type { SessionAnchorsRegistry, SessionAnchors } from './core/session-anchors.js';
 import { AuditLogService } from './core/audit-log.js';
@@ -112,6 +112,7 @@ export function registerSupervisorRpc(
   getTurnRegistry?: () => TurnRegistry,
   getConfiguredProviders?: () => ConfiguredProvider[],
   getAnchorsRegistry?: () => SessionAnchorsRegistry,
+  persistConfig?: (cfg: SupervisorConfig) => void,
 ): void {
   registerMethod('rc.supervisor.status', async () => {
     const cfg = getActiveConfig();
@@ -145,8 +146,35 @@ export function registerSupervisorRpc(
   registerMethod('rc.supervisor.config', async (params) => {
     if (params && typeof params === 'object' && Object.keys(params).length > 0) {
       const current = getActiveConfig();
-      const updated = parseConfig({ ...current, ...params as Record<string, unknown> });
+      // Only accept known config keys — reject arbitrary params
+      const ALLOWED_KEYS = [
+        'enabled', 'supervisorModel', 'reviewMode',
+        'appendReviewToChannelOutput', 'memoryGuard',
+        'courseCorrection', 'preReviewFilter', 'highRiskTools',
+      ] as const;
+      const filtered: Record<string, unknown> = {};
+      for (const key of ALLOWED_KEYS) {
+        if (key in (params as Record<string, unknown>)) {
+          filtered[key] = (params as Record<string, unknown>)[key];
+        }
+      }
+      if (Object.keys(filtered).length === 0) {
+        return { ok: true, config: current };
+      }
+      // Deep-merge nested config objects to preserve sub-fields on partial updates
+      const merged: Record<string, unknown> = { ...current, ...filtered };
+      if (filtered.memoryGuard && typeof filtered.memoryGuard === 'object' && current.memoryGuard) {
+        merged.memoryGuard = { ...current.memoryGuard, ...(filtered.memoryGuard as Record<string, unknown>) };
+      }
+      if (filtered.courseCorrection && typeof filtered.courseCorrection === 'object' && current.courseCorrection) {
+        merged.courseCorrection = { ...current.courseCorrection, ...(filtered.courseCorrection as Record<string, unknown>) };
+      }
+      if (filtered.preReviewFilter && typeof filtered.preReviewFilter === 'object' && current.preReviewFilter) {
+        merged.preReviewFilter = { ...current.preReviewFilter, ...(filtered.preReviewFilter as Record<string, unknown>) };
+      }
+      const updated = parseConfig(merged);
       setActiveConfig(updated);
+      persistConfig?.(updated);
       logger.info(`Supervisor config updated: mode=${updated.reviewMode}, model=${updated.supervisorModel}`);
       return { ok: true, config: updated };
     }
@@ -154,11 +182,12 @@ export function registerSupervisorRpc(
   });
 
   registerMethod('rc.supervisor.log', async (params) => {
-    const p = params as { limit?: number; offset?: number; sessionId?: string; type?: string; action?: string };
+    const p = params as { limit?: number; offset?: number; sessionId?: string; type?: AuditLogType; action?: string };
     const entries = auditLog.list({
       limit: p.limit ?? 50,
       offset: p.offset ?? 0,
       sessionId: p.sessionId,
+      type: p.type,
       action: p.action,
     });
     return { entries, total: entries.length };
@@ -178,6 +207,7 @@ export function registerSupervisorRpc(
       reviewMode: enabled && current.reviewMode === 'off' ? 'correct' as const : current.reviewMode,
     };
     setActiveConfig(updated);
+    persistConfig?.(updated);
     logger.info(`Supervisor ${enabled ? 'enabled' : 'disabled'}`);
     return { ok: true, enabled: updated.enabled, reviewMode: updated.reviewMode };
   });

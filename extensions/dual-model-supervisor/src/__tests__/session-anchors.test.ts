@@ -74,7 +74,7 @@ describe('mergeGoal', () => {
     expect(a.researchGoal).toBe('machine learning for NLP');
 
     // 无 hint 时同样 keep
-    mergeGoal(a, 'totally different research goal', true);
+    mergeGoal(a, 'totally different research goal', true, 'unknown');
     expect(a.researchGoal).toBe('machine learning for NLP');
   });
 });

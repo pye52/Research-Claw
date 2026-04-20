@@ -271,7 +271,32 @@ function ensureConfig(filePath) {
     c.plugins.entries = {
       'research-claw-core': { enabled: true, config: { dbPath: RC_DB_PATH, autoTrackGit: true, defaultCitationStyle: 'apa', heartbeatDeadlineWarningHours: 48, pptRoot: 'integrations/ppt-master' } },
       'openclaw-weixin': { enabled: true },
-      'dual-model-supervisor': { enabled: true },
+      'dual-model-supervisor': {
+        enabled: true,
+        config: {
+          enabled: false,
+          supervisorModel: '',
+          reviewMode: 'off',
+          appendReviewToChannelOutput: true,
+          preReviewFilter: {
+            enabled: true,
+            minContentLength: 15,
+            gatekeeperMaxInputChars: 200,
+            alwaysReviewToolCalls: true,
+          },
+          memoryGuard: {
+            enabled: true,
+            keyCategories: ['research_goal', 'key_conclusion', 'user_preference', 'methodology_decision'],
+          },
+          courseCorrection: {
+            enabled: true,
+            deviationThreshold: 0.5,
+            forceRegenerate: false,
+            maxRegenerateAttempts: 3,
+          },
+          highRiskTools: ['exec', 'write', 'edit', 'send_notification', 'browser'],
+        },
+      },
     };
     changed = true;
   }

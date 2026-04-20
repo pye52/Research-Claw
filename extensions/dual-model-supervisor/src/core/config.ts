@@ -83,7 +83,7 @@ function parseStringArray(raw: unknown, defaults: string[]): string[] {
  * Check if supervisor is effectively active (enabled + model configured + mode not off).
  */
 export function isSupervisorActive(cfg: SupervisorConfig): boolean {
-  return cfg.enabled && cfg.supervisorModel.length > 0 && cfg.reviewMode !== 'off';
+  return cfg.enabled && cfg.reviewMode !== 'off';
 }
 
 /**

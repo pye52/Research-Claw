@@ -3,7 +3,7 @@
   "name": "Dual Model Supervisor",
   "version": "0.1.0",
   "description": "Dual-model supervision: course correction, memory guarding, and safety filtering",
-  "main": "dist/index.js",
+  "main": "index.ts",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -14,7 +14,7 @@
       },
       "supervisorModel": {
         "type": "string",
-        "description": "Reviewer model in provider/model format (e.g. openai/gpt-4o-mini). Leave empty to disable.",
+        "description": "Reviewer model in provider/model format (e.g. openai/gpt-4o-mini). Leave empty to inherit from main model.",
         "default": ""
       },
       "reviewMode": {
@@ -22,6 +22,37 @@
         "enum": ["off", "filter-only", "correct", "full"],
         "description": "off=disabled, filter-only=safety filtering only, correct=filter+course correction, full=filter+correction+memory guard",
         "default": "off"
+      },
+      "appendReviewToChannelOutput": {
+        "type": "boolean",
+        "description": "Whether to append review summaries to channel output messages",
+        "default": true
+      },
+      "preReviewFilter": {
+        "type": "object",
+        "description": "Pre-review filtering configuration to skip trivial content",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Enable pre-review filter layer",
+            "default": true
+          },
+          "minContentLength": {
+            "type": "number",
+            "description": "Minimum content length to trigger review",
+            "default": 15
+          },
+          "gatekeeperMaxInputChars": {
+            "type": "number",
+            "description": "Maximum input characters to send to gatekeeper",
+            "default": 200
+          },
+          "alwaysReviewToolCalls": {
+            "type": "boolean",
+            "description": "Always review messages containing tool calls regardless of other filters",
+            "default": true
+          }
+        }
       },
       "memoryGuard": {
         "type": "object",
@@ -51,6 +82,16 @@
             "type": "number",
             "description": "Deviation score threshold (0-1) above which correction is triggered",
             "default": 0.5
+          },
+          "forceRegenerate": {
+            "type": "boolean",
+            "description": "Enable force regeneration on severe deviation",
+            "default": false
+          },
+          "maxRegenerateAttempts": {
+            "type": "number",
+            "description": "Maximum number of regeneration attempts per turn",
+            "default": 3
           }
         }
       },

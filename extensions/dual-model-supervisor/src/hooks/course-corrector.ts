@@ -39,6 +39,7 @@ import { AuditLogService } from '../core/audit-log.js';
 import { SESSION_ANALYSIS_SYSTEM_PROMPT, FORCE_REGENERATE_CORRECTION_PROMPT } from '../core/prompts.js';
 import { isCourseCorrectionActive, isSupervisorActive, isForceRegenerateActive } from '../core/config.js';
 import { buildAnchorContextLines } from '../utils/anchor-context.js';
+import { validateDeviationAnalysis, validateForceRegenerateCorrection } from '../core/validators.js';
 
 function isTurnFinished(turn: TurnState): boolean {
   return (turn.phase as string) === 'sent';
@@ -132,14 +133,16 @@ export class CourseCorrector {
         contextParts.push(`Recent work summaries:\n${summaryText}`);
       }
 
-      const userContent = contextParts.length > 0
+      const rawContent = contextParts.length > 0
         ? contextParts.join('\n\n')
         : 'No session context available for analysis.';
+      const userContent = `<user_content>\n${rawContent}\n</user_content>`;
 
-      const result = await this.reviewerClient.review<SessionAnalysisResult>(
+      const raw = await this.reviewerClient.review<Record<string, unknown>>(
         SESSION_ANALYSIS_SYSTEM_PROMPT,
         userContent,
       );
+      const result = validateDeviationAnalysis(raw);
 
       if (!result) return;
 
@@ -247,14 +250,15 @@ export class CourseCorrector {
       contextParts.push(`Previous regeneration attempts: ${previousAttempts}`);
     }
 
-    const userContent = contextParts.join('\n\n');
+    const rawContent = contextParts.join('\n\n');
+    const userContent = `<user_content>\n${rawContent}\n</user_content>`;
 
     try {
-      const result = await this.reviewerClient.review<ForceRegenerateCorrectionResult>(
+      const raw = await this.reviewerClient.review<Record<string, unknown>>(
         FORCE_REGENERATE_CORRECTION_PROMPT,
         userContent,
       );
-      return result;
+      return validateForceRegenerateCorrection(raw);
     } catch (err) {
       this.logger.error(`Force regenerate correction generation failed: ${err instanceof Error ? err.message : String(err)}`);
       return null;

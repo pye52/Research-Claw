@@ -26,7 +26,7 @@ const DANGEROUS_PATTERNS = [
   /\brm\s+-rf\s+\//i,
   /\bformat\s+[a-z]:/i,
   /\bdd\s+if=/i,
-  /\b:\(\)\{\s*:\|\:&\s*\}/,  // Fork bomb
+  /:\(\)\s*\{[^}]*:\s*\|\s*:&\s*\}/,  // Fork bomb: :(){ :|:& };:
 ];
 
 /** Plaintext credential leakage patterns that trigger immediate block (password=, api_key=, etc. with long strings). */

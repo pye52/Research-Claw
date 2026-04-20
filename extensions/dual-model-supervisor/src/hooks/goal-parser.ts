@@ -23,13 +23,14 @@
  *    for example, a "replace" with low similarity may still be rejected).
  */
 
-import type { TaskParsingResult, SupervisorConfig, PluginLogger, TurnState } from '../core/types.js';
+import type { SupervisorConfig, PluginLogger, TurnState } from '../core/types.js';
 import type { GoalReplaceHint } from '../core/session-anchors.js';
 import { SessionAnchorsRegistry } from '../core/session-anchors.js';
 import { ReviewerClient } from '../client/reviewer.js';
 import { AuditLogService } from '../core/audit-log.js';
 import { TASK_PARSING_SYSTEM_PROMPT } from '../core/prompts.js';
 import { isSupervisorActive } from '../core/config.js';
+import { validateTaskParsingResult } from '../core/validators.js';
 
 export class GoalParser {
   private config: SupervisorConfig;
@@ -79,10 +80,12 @@ export class GoalParser {
         ? `--- Session anchor (current research goal) ---\n${anchorGoal}\n\n${userMessage}`
         : `--- Session anchor (current research goal) ---\n(none)\n\n${userMessage}`;
 
-      const result = await this.reviewerClient.review<TaskParsingResult>(
+      const userContent = `<user_content>\n${promptUser}\n</user_content>`;
+      const raw = await this.reviewerClient.review<Record<string, unknown>>(
         TASK_PARSING_SYSTEM_PROMPT,
-        promptUser,
+        userContent,
       );
+      const result = validateTaskParsingResult(raw);
 
       // Async race protection: if this turn has already been sent/finished during parsing, prohibit further staging writes (avoid polluting the next turn).
       if (turn.phase === 'sent') {

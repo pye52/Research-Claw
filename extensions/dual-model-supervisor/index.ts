@@ -14,6 +14,7 @@
  * use `CompactionEventRegistry` (see `src/core/compaction-event.ts`).
  */
 
+import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import Database from 'better-sqlite3';
@@ -40,6 +41,7 @@ import { SummaryExtractor } from './src/hooks/summary-extractor.js';
 import { PreReviewFilter } from './src/hooks/pre-review-filter.js';
 import { AuditLogService } from './src/core/audit-log.js';
 import { GATEKEEPER_SYSTEM_PROMPT } from './src/core/prompts.js';
+import { validateGatekeeperResult } from './src/core/validators.js';
 import { registerSupervisorRpc } from './src/rpc.js';
 import { snapshotMessageSendingCtx, SUPERVISOR_REVIEW_SUMMARY_MARKER } from './src/hooks/hook-context.js';
 import {
@@ -70,18 +72,23 @@ let _activeConfig: SupervisorConfig | null = null;
 /** OpenClaw `message_received` often omits `sessionId`; we mirror it from the latest `session_start`. */
 let _hookActiveSessionId: string | null = null;
 
+/** Guard to prevent duplicate hook registration on OC dual-pass register. */
+let _hooksDone = false;
+
 const _registry = new TurnRegistry();
 const _anchors = new SessionAnchorsRegistry();
 const _compactions = new CompactionEventRegistry();
 
 const DEFAULT_DB_PATH = path.join(os.homedir(), '.research-claw', 'supervisor.db');
 
-/**
- * Gate static supervisor rules: OpenClaw may call `before_prompt_build` several times per user turn;
- * each return value is concatenated, which previously duplicated this block 2–3×.
- */
-let _lastStaticSupervisorInjectAt = 0;
-const STATIC_SUPERVISOR_DEBOUNCE_MS = 1500;
+/** Toggle DIAG logging: true = emit debug logs, false = silent (production). */
+const DIAG_ENABLED = false;
+type DiagLogger = (message: string) => void;
+function makeDiagLogger(logger: PluginApi['logger']): DiagLogger {
+  return DIAG_ENABLED
+    ? (msg: string) => logger.debug?.(`[DIAG] ${msg}`)
+    : () => { /* noop */ };
+}
 
 const STATIC_SUPERVISOR_RULES_BODY = [
   '[Supervisor] You are under dual-model supervision. Follow these rules:',
@@ -90,13 +97,17 @@ const STATIC_SUPERVISOR_RULES_BODY = [
   '  - If you have forgotten key information discussed earlier, explicitly state: "I may have lost context, please remind me"',
 ].join('\n');
 
-function takeStaticSupervisorRulesBlock(reviewMode: string): string {
+/**
+ * Gate static supervisor rules: OpenClaw may call `before_prompt_build` several times per user turn;
+ * each return value is concatenated, which previously duplicated this block 2–3×.
+ * Uses TurnState.staticRulesInjected for precise per-turn deduplication.
+ */
+function takeStaticSupervisorRulesBlock(reviewMode: string, turn?: TurnState): string {
   if (reviewMode === 'off') return '';
-  const now = Date.now();
-  if (now - _lastStaticSupervisorInjectAt < STATIC_SUPERVISOR_DEBOUNCE_MS) {
-    return '';
-  }
-  _lastStaticSupervisorInjectAt = now;
+  // No turn context: inject once (no duplication risk without turn stitching)
+  if (!turn) return STATIC_SUPERVISOR_RULES_BODY;
+  if (turn.staticRulesInjected) return '';
+  turn.staticRulesInjected = true;
   return STATIC_SUPERVISOR_RULES_BODY;
 }
 
@@ -177,7 +188,12 @@ const plugin: PluginDefinition = {
     const globalCfg = api.config;
     const mergedProviders = _extractProviders(api.pluginConfig as Record<string, unknown> | undefined, globalCfg);
 
-    api.logger.info(`Dual Model Supervisor initializing (enabled=${cfg.enabled}, mode=${cfg.reviewMode}, model=${cfg.supervisorModel || '(none)'})`);
+    // Extract main model reference for fallback when supervisorModel is empty
+    const mainModel = (globalCfg?.agents as Record<string, unknown>)?.defaults as Record<string, unknown>;
+    const mainModelPrimary = (mainModel?.model as Record<string, unknown>)?.primary;
+    const fallbackModel = typeof mainModelPrimary === 'string' ? mainModelPrimary : '';
+
+    api.logger.info(`Dual Model Supervisor initializing (enabled=${cfg.enabled}, mode=${cfg.reviewMode}, model=${cfg.supervisorModel || `(inherit: ${fallbackModel})` || '(none)'})`);
 
     if (!_initialized) {
       _db = new Database(DEFAULT_DB_PATH);
@@ -190,6 +206,7 @@ const plugin: PluginDefinition = {
         supervisorConfig: cfg,
         providers: mergedProviders,
         logger: api.logger,
+        fallbackModel,
       });
 
       _quickChecker = new QuickChecker(cfg, api.logger);
@@ -215,6 +232,7 @@ const plugin: PluginDefinition = {
     } else {
       _reviewerClient!.updateProviders(mergedProviders);
       _reviewerClient!.updateSupervisorConfig(_activeConfig ?? cfg);
+      _reviewerClient!.updateFallbackModel(fallbackModel);
     }
 
     const reviewerClient = _reviewerClient!;
@@ -227,6 +245,7 @@ const plugin: PluginDefinition = {
     const goalParser = _goalParser!;
     const summaryExtractor = _summaryExtractor!;
     const preReviewFilter = _preReviewFilter!;
+    const diag = makeDiagLogger(api.logger);
 
     api.registerService({
       id: 'supervisor-db',
@@ -263,6 +282,37 @@ const plugin: PluginDefinition = {
       });
     };
 
+    // ── Config persistence callback ────────────────────────────────
+    const configPath = path.join(process.cwd(), 'config', 'openclaw.json');
+    const persistConfig = (newCfg: SupervisorConfig): void => {
+      try {
+        if (!fs.existsSync(configPath)) return;
+        const raw = fs.readFileSync(configPath, 'utf8');
+        const ocConfig = JSON.parse(raw);
+        if (!ocConfig.plugins) ocConfig.plugins = {};
+        if (!ocConfig.plugins.entries) ocConfig.plugins.entries = {};
+        if (!ocConfig.plugins.entries['dual-model-supervisor']) {
+          ocConfig.plugins.entries['dual-model-supervisor'] = {};
+        }
+        ocConfig.plugins.entries['dual-model-supervisor'].config = {
+          enabled: newCfg.enabled,
+          supervisorModel: newCfg.supervisorModel,
+          reviewMode: newCfg.reviewMode,
+          appendReviewToChannelOutput: newCfg.appendReviewToChannelOutput,
+          memoryGuard: newCfg.memoryGuard,
+          courseCorrection: newCfg.courseCorrection,
+          preReviewFilter: newCfg.preReviewFilter,
+          highRiskTools: newCfg.highRiskTools,
+        };
+        const tmpPath = configPath + '.tmp';
+        fs.writeFileSync(tmpPath, JSON.stringify(ocConfig, null, 2) + '\n', 'utf8');
+        fs.renameSync(tmpPath, configPath);
+        api.logger.info('Supervisor config persisted to openclaw.json');
+      } catch (err) {
+        api.logger.warn(`Failed to persist supervisor config: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+
     registerSupervisorRpc(
       registerMethod,
       auditLog,
@@ -283,9 +333,11 @@ const plugin: PluginDefinition = {
       () => _registry,
       () => _extractConfiguredProviders(api.pluginConfig as Record<string, unknown> | undefined, globalCfg),
       () => _anchors,
+      persistConfig,
     );
 
-    // ── Register hooks ───────────────────────────────────────────
+    // ── Register hooks (guarded: only once across discovery + gateway passes) ──
+    if (!_hooksDone) {
 
     api.on('session_start', (ctx: unknown) => {
       const c = ctx as { sessionId?: string };
@@ -301,18 +353,21 @@ const plugin: PluginDefinition = {
         return {};
       }
 
-      const staticBlock = takeStaticSupervisorRulesBlock(activeCfg.reviewMode);
-
       const c = ctx as { sessionId?: string };
       const sessionId = c.sessionId ?? _hookActiveSessionId ?? undefined;
+
+      let turn: TurnState | undefined;
+      if (sessionId) {
+        turn = resolveTurn(_registry, sessionId, 'llm_input', {}, api.logger);
+      }
+
+      const staticBlock = takeStaticSupervisorRulesBlock(activeCfg.reviewMode, turn);
       if (!sessionId) {
         return staticBlock.length > 0 ? { prependContext: staticBlock } : {};
       }
 
       let drained = _anchors.drainBlocks(sessionId);
       const anchorView = _anchors.view(sessionId);
-
-      const turn = resolveTurn(_registry, sessionId, 'llm_input', {}, api.logger);
 
       if (!turn && drained.length > 0) {
         for (const b of drained) {
@@ -374,8 +429,8 @@ const plugin: PluginDefinition = {
       // awaited hook handlers in the same async chain will pick it up.
       turnStore.enterWith(turn);
 
-      api.logger.info(
-        `[DIAG] message_received: created turn ${turn.turnId} for session ${sessionId} (messageLen=${message.length})`,
+      diag(
+        `message_received: created turn ${turn.turnId} for session ${sessionId} (messageLen=${message.length})`,
       );
 
       if (message.length > 0) {
@@ -395,8 +450,10 @@ const plugin: PluginDefinition = {
         }
 
         const truncatedMessage = message.slice(0, activeCfg.preReviewFilter.gatekeeperMaxInputChars);
-        reviewerClient.review<GatekeeperResult>(GATEKEEPER_SYSTEM_PROMPT, truncatedMessage)
-          .then((gateResult) => {
+        const wrappedMessage = `<user_content>\n${truncatedMessage}\n</user_content>`;
+        reviewerClient.review<GatekeeperResult>(GATEKEEPER_SYSTEM_PROMPT, wrappedMessage)
+          .then((rawResult) => {
+            const gateResult = validateGatekeeperResult(rawResult);
             if (turn.phase === 'sent') {
               api.logger.warn(`[PreReviewFilter] Gatekeeper callback: turn ${turn.turnId} already finished, skipping.`);
               return;
@@ -451,13 +508,13 @@ const plugin: PluginDefinition = {
         api.logger,
       );
       if (!turn) {
-        api.logger.warn(`[DIAG] llm_input: no active turn for session ${sessionId ?? '(none)'}`);
+        diag(`llm_input: no active turn for session ${sessionId ?? '(none)'}`);
         return;
       }
       _registry.advancePhase(turn, 'llm_input');
 
       if (turn.trivialTurn) {
-        api.logger.info(`[DIAG] llm_input: Trivial turn ${turn.turnId} — skipping consistency check`);
+        diag(`llm_input: Trivial turn ${turn.turnId} — skipping consistency check`);
         return;
       }
 
@@ -481,20 +538,16 @@ const plugin: PluginDefinition = {
       const outputText = extractLlmOutputText(context);
       const sessionId = (context.sessionId as string | undefined) ?? _hookActiveSessionId ?? undefined;
 
-      if (sessionId && sessionId !== _hookActiveSessionId) {
-        _hookActiveSessionId = sessionId;
-      }
-
-      api.logger.info(`[DIAG] llm_output ENTERED. sessionId=${sessionId}, hasOutputText=${!!outputText}, outputLen=${outputText?.length ?? 0}, ctxKeys=${Object.keys(context).join(',')}`);
+      diag(`llm_output ENTERED. sessionId=${sessionId}, hasOutputText=${!!outputText}, outputLen=${outputText?.length ?? 0}, ctxKeys=${Object.keys(context).join(',')}`);
 
       if (!sessionId || !outputText) {
-        api.logger.info(`[DIAG] llm_output EARLY EXIT. sessionId=${sessionId}, hasOutputText=${!!outputText}`);
+        diag(`llm_output EARLY EXIT. sessionId=${sessionId}, hasOutputText=${!!outputText}`);
         return;
       }
 
       const turn = resolveTurn(_registry, sessionId, 'llm_output', {}, api.logger);
       if (!turn) {
-        api.logger.warn(`[DIAG] llm_output: no active turn for session ${sessionId}`);
+        diag(`llm_output: no active turn for session ${sessionId}`);
         return;
       }
       _registry.advancePhase(turn, 'llm_output');
@@ -503,7 +556,7 @@ const plugin: PluginDefinition = {
         turn.turnLlmOutput = outputText;
 
         if (turn.trivialTurn) {
-          api.logger.info(`[DIAG] llm_output: Trivial turn ${turn.turnId} — skipping summary/review/course-correction`);
+          diag(`llm_output: Trivial turn ${turn.turnId} — skipping summary/review/course-correction`);
           return;
         }
 
@@ -514,32 +567,32 @@ const plugin: PluginDefinition = {
 
         if (!outputText.includes(SUPERVISOR_REVIEW_SUMMARY_MARKER)) {
           const shouldAttachToChannel = activeCfg.appendReviewToChannelOutput;
-          api.logger.info(`[DIAG] llm_output: Starting ASYNC review for turn ${turn.turnId}. shouldAttachToChannel=${shouldAttachToChannel}`);
+          diag(`llm_output: Starting ASYNC review for turn ${turn.turnId}. shouldAttachToChannel=${shouldAttachToChannel}`);
           const reviewStartTime = Date.now();
           outputReviewer.reviewMessageSending(outputText, turn, _anchors.view(sessionId), _anchors, {
             attachSummary: shouldAttachToChannel,
           }).then((modified) => {
             const elapsed = Date.now() - reviewStartTime;
             if (turn.phase === 'sent') {
-              api.logger.warn(`[DIAG] llm_output: ASYNC review completed after turn ${turn.turnId} was finalized — discarding.`);
+              diag(`llm_output: ASYNC review completed after turn ${turn.turnId} was finalized — discarding.`);
               return;
             }
             if (modified !== null) {
               turn.pendingChannelReviewFooter = modified;
-              api.logger.info(`[DIAG] llm_output: ASYNC review COMPLETED in ${elapsed}ms. Channel footer cached (${modified.length} chars)`);
+              diag(`llm_output: ASYNC review COMPLETED in ${elapsed}ms. Channel footer cached (${modified.length} chars)`);
             } else {
-              api.logger.info(`[DIAG] llm_output: ASYNC review returned null in ${elapsed}ms.`);
+              diag(`llm_output: ASYNC review returned null in ${elapsed}ms.`);
             }
           }).catch((err) => {
-            api.logger.error(`[DIAG] llm_output: ASYNC review FAILED: ${err instanceof Error ? err.message : String(err)}`);
+            diag(`llm_output: ASYNC review FAILED: ${err instanceof Error ? err.message : String(err)}`);
           });
         }
       } catch (err) {
-        api.logger.error(
-          `[DIAG] llm_output SYNC error: ${err instanceof Error ? err.message : String(err)}`,
+        diag(
+          `llm_output SYNC error: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      api.logger.info(`[DIAG] llm_output EXITING (sync portion done)`);
+      diag(`llm_output EXITING (sync portion done)`);
     });
 
     // message_sending — for channel delivery, attach review footer (cached or
@@ -547,7 +600,7 @@ const plugin: PluginDefinition = {
     api.on('message_sending', async (ctx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       const context = ctx as { sessionId?: string; message?: string };
-      api.logger.info(`[DIAG] message_sending ENTERED. enabled=${activeCfg.enabled}, reviewMode=${activeCfg.reviewMode}, hasMessage=${!!context.message}, messageLen=${context.message?.length ?? 0}, sessionId=${context.sessionId ?? '(none)'}`);
+      diag(`message_sending ENTERED. enabled=${activeCfg.enabled}, reviewMode=${activeCfg.reviewMode}, hasMessage=${!!context.message}, messageLen=${context.message?.length ?? 0}, sessionId=${context.sessionId ?? '(none)'}`);
 
       if (!isSupervisorActive(activeCfg)) {
         return {};
@@ -559,26 +612,26 @@ const plugin: PluginDefinition = {
 
       const snap = snapshotMessageSendingCtx(ctx);
       const isChannelDelivery = snap.isChannelDelivery;
-      api.logger.info(`[DIAG] message_sending: isChannelDelivery=${isChannelDelivery}, channel=${JSON.stringify(snap.flags.channel)}, source=${JSON.stringify(snap.flags.source)}`);
+      diag(`message_sending: isChannelDelivery=${isChannelDelivery}, channel=${JSON.stringify(snap.flags.channel)}, source=${JSON.stringify(snap.flags.source)}`);
 
       if (snap.deferReview) {
-        api.logger.info(`[DIAG] message_sending: deferReview=true, returning {}`);
+        diag(`message_sending: deferReview=true, returning {}`);
         return {};
       }
 
       const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
       const turn = resolveTurn(_registry, sessionId, 'sending', {}, api.logger);
       if (!turn) {
-        api.logger.warn(`[DIAG] message_sending: no active turn for session ${sessionId ?? '(none)'}; passing through`);
+        diag(`message_sending: no active turn for session ${sessionId ?? '(none)'}; passing through`);
         return {};
       }
       _registry.advancePhase(turn, 'sending');
 
       try {
         if (!isChannelDelivery) {
-          api.logger.info(`[DIAG] message_sending: Not a channel delivery — skipping footer append.`);
+          diag(`message_sending: Not a channel delivery — skipping footer append.`);
           if (turn.pendingChannelReviewFooter) {
-            api.logger.info(`[DIAG] message_sending: Clearing cached channel footer (${turn.pendingChannelReviewFooter.length} chars)`);
+            diag(`message_sending: Clearing cached channel footer (${turn.pendingChannelReviewFooter.length} chars)`);
             turn.pendingChannelReviewFooter = undefined;
           }
           return {};
@@ -587,16 +640,16 @@ const plugin: PluginDefinition = {
         if (turn.pendingChannelReviewFooter) {
           const footer = turn.pendingChannelReviewFooter;
           turn.pendingChannelReviewFooter = undefined;
-          api.logger.info(`[DIAG] message_sending: Found CACHED channel footer (${footer.length} chars), returning it`);
+          diag(`message_sending: Found CACHED channel footer (${footer.length} chars), returning it`);
           return { message: footer };
         }
 
         if (!activeCfg.appendReviewToChannelOutput) {
-          api.logger.info(`[DIAG] message_sending: appendReviewToChannelOutput=false, skipping footer`);
+          diag(`message_sending: appendReviewToChannelOutput=false, skipping footer`);
           return {};
         }
 
-        api.logger.info(`[DIAG] message_sending: No cached footer, performing LIVE review for turn ${turn.turnId}`);
+        diag(`message_sending: No cached footer, performing LIVE review for turn ${turn.turnId}`);
         const reviewStartTime = Date.now();
         const modified = await outputReviewer.reviewMessageSending(
           context.message,
@@ -608,11 +661,11 @@ const plugin: PluginDefinition = {
         const elapsed = Date.now() - reviewStartTime;
 
         if (modified !== null) {
-          api.logger.info(`[DIAG] message_sending: LIVE review completed in ${elapsed}ms, returning modified (${modified.length} chars)`);
+          diag(`message_sending: LIVE review completed in ${elapsed}ms, returning modified (${modified.length} chars)`);
           return { message: modified };
         }
 
-        api.logger.info(`[DIAG] message_sending: LIVE review returned null in ${elapsed}ms.`);
+        diag(`message_sending: LIVE review returned null in ${elapsed}ms.`);
         return {};
       } finally {
         if (sessionId) {
@@ -620,7 +673,7 @@ const plugin: PluginDefinition = {
         }
         turn.stagedAnchorUpdates = {};
         _registry.finish(turn);
-        api.logger.info(`[DIAG] message_sending: finalized turn ${turn.turnId}`);
+        diag(`message_sending: finalized turn ${turn.turnId}`);
       }
     });
 
@@ -705,7 +758,7 @@ const plugin: PluginDefinition = {
 
       const ev = _compactions.current(sessionId);
       if (!ev) {
-        api.logger.warn(`[DIAG] after_compaction: no compaction event for session ${sessionId}`);
+        diag(`after_compaction: no compaction event for session ${sessionId}`);
         return;
       }
 
@@ -751,6 +804,8 @@ const plugin: PluginDefinition = {
     });
 
     api.logger.info('Dual Model Supervisor registered (7 hooks + 6 RPC methods)');
+    _hooksDone = true;
+    } // end _hooksDone guard
   },
 };
 

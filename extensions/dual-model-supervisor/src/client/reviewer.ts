@@ -70,12 +70,14 @@ export interface ReviewerClientOptions {
   supervisorConfig: SupervisorConfig;
   providers: Record<string, ModelsProviderEntry>;
   logger: PluginLogger;
+  fallbackModel?: string;
 }
 
 export class ReviewerClient {
   private supervisorConfig: SupervisorConfig;
   private providers: Record<string, ModelsProviderEntry>;
   private logger: PluginLogger;
+  private fallbackModel: string;
   /** Cached adapter for current `supervisorModel` provider; refreshed on config/provider updates. */
   private _adapter: ReviewerApiAdapter | null = null;
 
@@ -89,6 +91,7 @@ export class ReviewerClient {
     this.supervisorConfig = opts.supervisorConfig;
     this.providers = opts.providers;
     this.logger = opts.logger;
+    this.fallbackModel = opts.fallbackModel ?? '';
     this._resolveAdapter();
   }
 
@@ -103,14 +106,26 @@ export class ReviewerClient {
     this._resolveAdapter();
   }
 
+  updateFallbackModel(fallbackModel: string): void {
+    this.fallbackModel = fallbackModel;
+    this._resolveAdapter();
+  }
+
   /**
    * Recompute protocol adapter for `supervisorModel` → provider `api` (must be supported reviewer protocol).
+   * Falls back to `fallbackModel` when supervisorModel is empty.
    */
   private _resolveAdapter(): void {
     const cfg = this.supervisorConfig;
-    const parsed = parseModelRef(cfg.supervisorModel);
+    const modelRef = cfg.supervisorModel || this.fallbackModel;
+    if (!modelRef) {
+      this.logger.warn('[ReviewerClient] No supervisorModel or fallbackModel configured');
+      this._adapter = null;
+      return;
+    }
+    const parsed = parseModelRef(modelRef);
     if (!parsed) {
-      this.logger.error(`[ReviewerClient] Failed to parse model reference: ${cfg.supervisorModel}`);
+      this.logger.error(`[ReviewerClient] Failed to parse model reference: ${modelRef}`);
       this._adapter = null;
       return;
     }
@@ -185,9 +200,14 @@ export class ReviewerClient {
 
   private async _callApi(systemPrompt: string, userContent: string): Promise<unknown | null> {
     const cfg = this.supervisorConfig;
-    const parsed = parseModelRef(cfg.supervisorModel);
+    const modelRef = cfg.supervisorModel || this.fallbackModel;
+    if (!modelRef) {
+      this.logger.error('[ReviewerClient] No supervisorModel or fallbackModel configured');
+      return null;
+    }
+    const parsed = parseModelRef(modelRef);
     if (!parsed) {
-      this.logger.error(`Invalid model reference: ${cfg.supervisorModel}`);
+      this.logger.error(`Invalid model reference: ${modelRef}`);
       return null;
     }
 

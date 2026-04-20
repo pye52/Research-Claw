@@ -45,6 +45,7 @@ import { AuditLogService } from '../core/audit-log.js';
 import { isForceRegenerateActive } from '../core/config.js';
 import { OUTPUT_REVIEW_SYSTEM_PROMPT } from '../core/prompts.js';
 import { SUPERVISOR_REVIEW_SUMMARY_MARKER } from './hook-context.js';
+import { validateReviewResult } from '../core/validators.js';
 
 /**
  * When the reviewer does not provide reportText, assemble a minimal usable footer from structured fields.
@@ -188,7 +189,13 @@ export class OutputReviewer {
       this.logger.warn('[OutputReviewer] Deep review skipped: no turn state or anchors');
     }
 
+    if (!attachSummary) {
+      return null;
+    }
+
+    const sections: string[] = [];
     if (quickResult.warnings.length > 0) {
+      sections.push(...quickResult.warnings.map((w) => `  ⚠ [Quick] ${w}`));
       for (const w of quickResult.warnings) {
         this.logger.warn(`[OutputReviewer] Quick check warning: ${w}`);
         this.auditLog.record({
@@ -199,17 +206,6 @@ export class OutputReviewer {
           timestamp: Date.now(),
         });
       }
-    }
-
-    // ── Priority 5: Footer append (external channels only) ────────────────
-    // Dashboard messages are displayed separately via the Supervisor panel; footer is not appended to the conversation flow.
-    if (!attachSummary) {
-      return null;
-    }
-
-    const sections: string[] = [];
-    if (quickResult.warnings.length > 0) {
-      sections.push(...quickResult.warnings.map((w) => `  ⚠ [Quick] ${w}`));
     }
 
     if (deep) {
@@ -263,14 +259,16 @@ export class OutputReviewer {
     }
 
     // ## Context first, ## Output to Review after: reviewer establishes anchors first, then evaluates the current message.
-    const userContent = contextParts.length > 0
+    const innerContent = contextParts.length > 0
       ? `## Context\n${contextParts.join('\n\n')}\n\n## Output to Review\n${message}`
       : message;
+    const userContent = `<user_content>\n${innerContent}\n</user_content>`;
 
-    const result = await this.reviewerClient.review<ReviewResult>(
+    const raw = await this.reviewerClient.review<Record<string, unknown>>(
       OUTPUT_REVIEW_SYSTEM_PROMPT,
       userContent,
     );
+    const result = validateReviewResult(raw);
 
     if (!result) {
       this.logger.warn(`[OutputReviewer] Deep review unavailable for turn ${turn.turnId} (reviewer call failed)`);
