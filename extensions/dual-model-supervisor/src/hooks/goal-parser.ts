@@ -1,5 +1,5 @@
 /**
- * Dual Model Supervisor — GoalParser (`message_received` hook)
+ * Dual Model Supervisor — GoalParser (`before_prompt_build` hook, via parseGoal)
  *
  * Responsibilities
  *  - At the start of every user turn, parse that user message into a structured "research intent":

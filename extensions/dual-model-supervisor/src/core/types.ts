@@ -126,7 +126,7 @@ export interface AuditLogEntry {
 // ── Turn State ─────────────────────────────────────────────────────────
 //
 // IMPORTANT: `TurnState` represents the complete state of ONE user message's
-// processing lifecycle (from `message_received` through `message_sending`).
+// processing lifecycle (from `before_prompt_build` turn creation through `message_sending`).
 //
 // There is NO cross-turn state. Each new user message starts a fresh TurnState
 // with default empty values. Hook handlers within one turn share the same
@@ -181,8 +181,7 @@ export interface RegenerateHistoryEntry {
 
 /** Lifecycle phase of a turn, advanced by hook handlers as the pipeline progresses. */
 export type TurnPhase =
-  | 'received'            // message_received fired, awaiting prompt/llm_input
-  | 'before_agent_reply'  // before_agent_reply fired (deferred turn creation), awaiting prompt/llm_input
+  | 'received'            // turn created in before_prompt_build, awaiting llm_input
   | 'llm_input'           // llm_input fired, awaiting llm_output
   | 'llm_output'          // llm_output fired, awaiting send
   | 'sending'             // before_message_write or message_sending in progress

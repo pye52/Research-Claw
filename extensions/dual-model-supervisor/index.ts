@@ -1,8 +1,8 @@
 /**
  * Dual Model Supervisor — Plugin Entry Point
  *
- * Registers 8 hooks + 6 RPC methods for dual-model supervision:
- *   - Turn creation & pre-review (before_agent_reply: Layer1 filter + Layer2 gatekeeper)
+ * Registers 7 hooks + 6 RPC methods for dual-model supervision:
+ *   - Turn creation & pre-review (before_prompt_build: Layer1 filter + Layer2 gatekeeper)
  *   - Safety filtering (message_sending, before_tool_call)
  *   - Course correction (llm_output → session analysis, before_prompt_build, llm_input → consistency check → enqueueBlock)
  *   - Memory guarding (before_compaction, after_compaction)
@@ -342,97 +342,78 @@ const plugin: PluginDefinition = {
       }
     });
 
-    // before_agent_reply — primary turn creation + review site (await, has sessionId).
-    // All turn creation and pre-review filtering (Layer1 + Layer2) happen here,
-    api.on('before_agent_reply', async (event: unknown, hookCtx: unknown) => {
-      const activeCfg = _activeConfig ?? cfg;
-      if (!isSupervisorActive(activeCfg)) {
-        return;
-      }
-
-      const ev = event as { cleanedBody?: string };
-      const ct = hookCtx as { sessionId?: string; agentId?: string; sessionKey?: string };
-      const sessionId = ct.sessionId ?? _hookActiveSessionId ?? undefined;
-
-      // Update _hookActiveSessionId if we just got one
-      if (sessionId && !_hookActiveSessionId) {
-        _hookActiveSessionId = sessionId;
-      }
-
-      if (!sessionId) {
-        diag('before_agent_reply: no sessionId, cannot create turn');
-        return;
-      }
-
-      // Safety check: if a turn already exists for this session, skip creation
-      const existingTurn = resolveTurn(_registry, sessionId, 'before_agent_reply', {}, api.logger);
-      if (existingTurn) {
-        diag(`before_agent_reply: turn ${existingTurn.turnId} already exists for session ${sessionId}, skipping`);
-        return;
-      }
-
-      // Create turn — before_agent_reply is the sole creation point
-      const message = ev.cleanedBody ?? '';
-      const turn = _registry.create(sessionId, message);
-      turnStore.enterWith(turn);
-      diag(`before_agent_reply: created turn ${turn.turnId} for session ${sessionId} (messageLen=${message.length})`);
-
-      if (message.length > 0) {
-        // Run preReviewFilter Layer1 (synchronous)
-        const localResult = preReviewFilter.shouldReview(message);
-        if (localResult.decision === 'skip') {
-          turn.trivialTurn = true;
-          api.logger.info(`[PreReviewFilter] Layer1 SKIP: ${localResult.reason}`);
-          auditLog.record({
-            sessionId,
-            type: 'output_review',
-            action: 'info',
-            details: `pre_review_filter_skip: ${localResult.reason}`,
-            timestamp: Date.now(),
-          });
-          return;
-        }
-
-        // Run gatekeeper Layer2 (synchronous await — guaranteed before LLM call)
-        try {
-          const truncatedMessage = message.slice(0, activeCfg.preReviewFilter.gatekeeperMaxInputChars);
-          const wrappedMessage = `<user_content>\n${truncatedMessage}\n</user_content>`;
-          const rawResult = await reviewerClient.review<GatekeeperResult>(GATEKEEPER_SYSTEM_PROMPT, wrappedMessage);
-          const gateResult = validateGatekeeperResult(rawResult);
-          if (gateResult && !gateResult.needReview) {
-            turn.trivialTurn = true;
-            api.logger.info(`[PreReviewFilter] Layer2 SKIP (gatekeeper): ${gateResult.reason}`);
-            auditLog.record({
-              sessionId,
-              type: 'output_review',
-              action: 'info',
-              details: `gatekeeper_skip: ${gateResult.reason}`,
-              timestamp: Date.now(),
-            });
-          } else {
-            api.logger.info(`[PreReviewFilter] Layer2 PASS (gatekeeper): ${gateResult?.reason ?? 'no result'}`);
-            goalParser.parseGoal(message, turn, _anchors);
-          }
-        } catch (err) {
-          api.logger.error(`[PreReviewFilter] Gatekeeper failed: ${err instanceof Error ? err.message : String(err)}`);
-          goalParser.parseGoal(message, turn, _anchors);
-        }
-      }
-    });
-
-    // before_prompt_build — inject supervisor rules + session anchors + drained prepend queue + course corrections
-    api.on('before_prompt_build', (_event: unknown, hookCtx: unknown) => {
+    // before_prompt_build — primary turn creation + pre-review (Layer1 + Layer2 gatekeeper),
+    // then inject supervisor rules + session anchors + drained prepend queue + course corrections.
+    // Tool loops call this multiple times; resolveTurn(..., 'received', { userMessage: prompt }) dedupes creation.
+    api.on('before_prompt_build', async (event: unknown, hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
 
+      const ev = event as { prompt?: string; messages?: unknown[] };
       const ct = hookCtx as { sessionId?: string; agentId?: string; sessionKey?: string };
       const sessionId = ct.sessionId ?? _hookActiveSessionId ?? undefined;
+      if (sessionId && !_hookActiveSessionId) {
+        _hookActiveSessionId = sessionId;
+      }
+
+      const promptText = ev.prompt ?? '';
 
       let turn: TurnState | undefined;
       if (sessionId) {
-        turn = resolveTurn(_registry, sessionId, 'llm_input', {}, api.logger);
+        turn = resolveTurn(
+          _registry,
+          sessionId,
+          'received',
+          { userMessage: promptText },
+          api.logger,
+        );
+      }
+
+      if (!turn && sessionId) {
+        turn = _registry.create(sessionId, promptText);
+        turnStore.enterWith(turn);
+        diag(`before_prompt_build: created turn ${turn.turnId} for session ${sessionId} (messageLen=${promptText.length})`);
+
+        if (promptText.length > 0) {
+          const localResult = preReviewFilter.shouldReview(promptText);
+          if (localResult.decision === 'skip') {
+            turn.trivialTurn = true;
+            api.logger.info(`[PreReviewFilter] Layer1 SKIP: ${localResult.reason}`);
+            auditLog.record({
+              sessionId,
+              type: 'output_review',
+              action: 'info',
+              details: `pre_review_filter_skip: ${localResult.reason}`,
+              timestamp: Date.now(),
+            });
+          } else {
+            try {
+              const truncatedMessage = promptText.slice(0, activeCfg.preReviewFilter.gatekeeperMaxInputChars);
+              const wrappedMessage = `<user_content>\n${truncatedMessage}\n</user_content>`;
+              const rawResult = await reviewerClient.review<GatekeeperResult>(GATEKEEPER_SYSTEM_PROMPT, wrappedMessage);
+              const gateResult = validateGatekeeperResult(rawResult);
+              if (gateResult && !gateResult.needReview) {
+                turn.trivialTurn = true;
+                api.logger.info(`[PreReviewFilter] Layer2 SKIP (gatekeeper): ${gateResult.reason}`);
+                auditLog.record({
+                  sessionId,
+                  type: 'output_review',
+                  action: 'info',
+                  details: `gatekeeper_skip: ${gateResult.reason}`,
+                  timestamp: Date.now(),
+                });
+              } else {
+                api.logger.info(`[PreReviewFilter] Layer2 PASS (gatekeeper): ${gateResult?.reason ?? 'no result'}`);
+                goalParser.parseGoal(promptText, turn, _anchors);
+              }
+            } catch (err) {
+              api.logger.error(`[PreReviewFilter] Gatekeeper failed: ${err instanceof Error ? err.message : String(err)}`);
+              goalParser.parseGoal(promptText, turn, _anchors);
+            }
+          }
+        }
       }
 
       const staticBlock = takeStaticSupervisorRulesBlock(activeCfg.reviewMode, turn);
@@ -491,7 +472,7 @@ const plugin: PluginDefinition = {
       }
 
       const ev = event as { content?: string; from?: string };
-      diag(`message_received: messageLen=${(ev.content ?? '').length}, from=${ev.from ?? '(unknown)'}, turn creation deferred to before_agent_reply`);
+      diag(`message_received: messageLen=${(ev.content ?? '').length}, from=${ev.from ?? '(unknown)'}, turn creation in before_prompt_build`);
       return {};
     });
 
@@ -524,8 +505,7 @@ const plugin: PluginDefinition = {
         api.logger,
       );
 
-      // Fallback: if before_agent_reply missed creating a turn,
-      // create one here as a last resort
+      // Fallback: if before_prompt_build missed creating a turn, create one here as a last resort
       if (!turn && sessionId) {
         const userMessage = extractLastUserMessageText(messages) ?? '';
         turn = _registry.create(sessionId, userMessage);
@@ -842,7 +822,7 @@ const plugin: PluginDefinition = {
       }
     });
 
-    api.logger.info('Dual Model Supervisor registered (8 hooks + 6 RPC methods)');
+    api.logger.info('Dual Model Supervisor registered (7 hooks + 6 RPC methods)');
     _hooksDone = true;
     } // end _hooksDone guard
   },

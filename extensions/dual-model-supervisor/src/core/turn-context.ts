@@ -2,10 +2,10 @@
  * Turn Context — per-turn state isolation via AsyncLocalStorage + registry fallback.
  *
  * Each user message creates a fresh `TurnState` that lives for the duration of
- * the message's processing pipeline (message_received → message_sending).
+ * the message's processing pipeline (`before_prompt_build` → `message_sending`).
  * Hook handlers pick up the correct turn via:
  *   1. `turnStore.getStore()` — AsyncLocalStorage propagates along the async
- *      chain started in `message_received`. Concurrent turns A and B each have
+ *      chain started in `before_prompt_build`. Concurrent turns A and B each have
  *      their own async chain and never see each other's store.
  *   2. `TurnRegistry.resolve(...)` — fallback when ALS context is lost (e.g. if
  *      the gateway dispatches a hook through an EventEmitter that breaks async
@@ -51,7 +51,7 @@ export class TurnRegistry {
   private counters = new Map<string, number>();
 
   /**
-   * Register a brand-new TurnState and return it. Called from `message_received`.
+   * Register a brand-new TurnState and return it. Called from `before_prompt_build` (or `llm_input` fallback).
    */
   create(sessionId: string, userMessage: string): TurnState {
     const prev = this.counters.get(sessionId) ?? 0;

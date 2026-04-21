@@ -103,11 +103,8 @@ describe('SessionAnchorsRegistry: per-session state isolation', () => {
   it('maintains independent anchors per session', () => {
     const registry = new SessionAnchorsRegistry();
     
-    const anchorsA = registry.view('session-a');
-    const anchorsB = registry.view('session-b');
-    
-    anchorsA.researchGoal = 'Goal A';
-    anchorsB.researchGoal = 'Goal B';
+    registry.merge('session-a', { researchGoal: 'Goal A', goalConfirmed: true });
+    registry.merge('session-b', { researchGoal: 'Goal B', goalConfirmed: true });
     
     expect(registry.view('session-a').researchGoal).toBe('Goal A');
     expect(registry.view('session-b').researchGoal).toBe('Goal B');
@@ -150,10 +147,10 @@ describe('SessionAnchorsRegistry: per-session state isolation', () => {
     const blocksB = registry.drainBlocks('session-b');
     
     expect(blocksA).toHaveLength(1);
-    expect(blocksA[0].text).toBe('Review A');
+    expect(blocksA[0]?.type === 'previousReview' ? blocksA[0].text : '').toBe('Review A');
     
     expect(blocksB).toHaveLength(1);
-    expect(blocksB[0].text).toBe('Review B');
+    expect(blocksB[0]?.type === 'previousReview' ? blocksB[0].text : '').toBe('Review B');
     
     // After draining, should be empty
     expect(registry.drainBlocks('session-a')).toHaveLength(0);
@@ -203,11 +200,11 @@ describe('Cross-component integration: session isolation', () => {
     
     // Session A
     const turnA = turnRegistry.create('session-a', 'Hello');
-    anchorRegistry.view('session-a').researchGoal = 'Research A';
+    anchorRegistry.merge('session-a', { researchGoal: 'Research A', goalConfirmed: true });
     
     // Session B
     const turnB = turnRegistry.create('session-b', 'World');
-    anchorRegistry.view('session-b').researchGoal = 'Research B';
+    anchorRegistry.merge('session-b', { researchGoal: 'Research B', goalConfirmed: true });
     
     // Verify isolation
     expect(turnRegistry.listActive('session-a')[0].userMessage).toBe('Hello');
