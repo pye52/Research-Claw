@@ -181,11 +181,12 @@ export interface RegenerateHistoryEntry {
 
 /** Lifecycle phase of a turn, advanced by hook handlers as the pipeline progresses. */
 export type TurnPhase =
-  | 'received'   // message_received fired, awaiting prompt/llm_input
-  | 'llm_input'  // llm_input fired, awaiting llm_output
-  | 'llm_output' // llm_output fired, awaiting send
-  | 'sending'    // before_message_write or message_sending in progress
-  | 'sent';      // message_sending completed; turn finalized
+  | 'received'            // message_received fired, awaiting prompt/llm_input
+  | 'before_agent_reply'  // before_agent_reply fired (deferred turn creation), awaiting prompt/llm_input
+  | 'llm_input'           // llm_input fired, awaiting llm_output
+  | 'llm_output'          // llm_output fired, awaiting send
+  | 'sending'             // before_message_write or message_sending in progress
+  | 'sent';               // message_sending completed; turn finalized
 
 export interface TurnState {
   // ── Turn identity ──

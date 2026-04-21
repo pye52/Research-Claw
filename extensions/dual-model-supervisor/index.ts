@@ -1,7 +1,8 @@
 /**
  * Dual Model Supervisor — Plugin Entry Point
  *
- * Registers 7 hooks + 6 RPC methods for dual-model supervision:
+ * Registers 8 hooks + 6 RPC methods for dual-model supervision:
+ *   - Turn creation & pre-review (before_agent_reply: Layer1 filter + Layer2 gatekeeper)
  *   - Safety filtering (message_sending, before_tool_call)
  *   - Course correction (llm_output → session analysis, before_prompt_build, llm_input → consistency check → enqueueBlock)
  *   - Memory guarding (before_compaction, after_compaction)
@@ -165,13 +166,6 @@ function extractLlmInputMessages(ctx: unknown): Array<{ role: string; content: u
     m = asMsgs(req.messages);
     if (m) return m;
   }
-  return undefined;
-}
-
-function extractToolCallName(ctx: unknown): string | undefined {
-  const c = ctx as { tool?: string; toolName?: string };
-  if (typeof c.tool === 'string' && c.tool.length > 0) return c.tool;
-  if (typeof c.toolName === 'string' && c.toolName.length > 0) return c.toolName;
   return undefined;
 }
 
@@ -339,22 +333,102 @@ const plugin: PluginDefinition = {
     // ── Register hooks (guarded: only once across discovery + gateway passes) ──
     if (!_hooksDone) {
 
-    api.on('session_start', (ctx: unknown) => {
-      const c = ctx as { sessionId?: string };
-      if (typeof c.sessionId === 'string' && c.sessionId.length > 0) {
-        _hookActiveSessionId = c.sessionId;
+    api.on('session_start', (event: unknown, hookCtx: unknown) => {
+      const ev = event as { sessionId?: string; sessionKey?: string };
+      const ct = hookCtx as { sessionId?: string; sessionKey?: string };
+      const sessionId = ev.sessionId ?? ct.sessionId;
+      if (typeof sessionId === 'string' && sessionId.length > 0) {
+        _hookActiveSessionId = sessionId;
+      }
+    });
+
+    // before_agent_reply — primary turn creation + review site (await, has sessionId).
+    // All turn creation and pre-review filtering (Layer1 + Layer2) happen here,
+    api.on('before_agent_reply', async (event: unknown, hookCtx: unknown) => {
+      const activeCfg = _activeConfig ?? cfg;
+      if (!isSupervisorActive(activeCfg)) {
+        return;
+      }
+
+      const ev = event as { cleanedBody?: string };
+      const ct = hookCtx as { sessionId?: string; agentId?: string; sessionKey?: string };
+      const sessionId = ct.sessionId ?? _hookActiveSessionId ?? undefined;
+
+      // Update _hookActiveSessionId if we just got one
+      if (sessionId && !_hookActiveSessionId) {
+        _hookActiveSessionId = sessionId;
+      }
+
+      if (!sessionId) {
+        diag('before_agent_reply: no sessionId, cannot create turn');
+        return;
+      }
+
+      // Safety check: if a turn already exists for this session, skip creation
+      const existingTurn = resolveTurn(_registry, sessionId, 'before_agent_reply', {}, api.logger);
+      if (existingTurn) {
+        diag(`before_agent_reply: turn ${existingTurn.turnId} already exists for session ${sessionId}, skipping`);
+        return;
+      }
+
+      // Create turn — before_agent_reply is the sole creation point
+      const message = ev.cleanedBody ?? '';
+      const turn = _registry.create(sessionId, message);
+      turnStore.enterWith(turn);
+      diag(`before_agent_reply: created turn ${turn.turnId} for session ${sessionId} (messageLen=${message.length})`);
+
+      if (message.length > 0) {
+        // Run preReviewFilter Layer1 (synchronous)
+        const localResult = preReviewFilter.shouldReview(message);
+        if (localResult.decision === 'skip') {
+          turn.trivialTurn = true;
+          api.logger.info(`[PreReviewFilter] Layer1 SKIP: ${localResult.reason}`);
+          auditLog.record({
+            sessionId,
+            type: 'output_review',
+            action: 'info',
+            details: `pre_review_filter_skip: ${localResult.reason}`,
+            timestamp: Date.now(),
+          });
+          return;
+        }
+
+        // Run gatekeeper Layer2 (synchronous await — guaranteed before LLM call)
+        try {
+          const truncatedMessage = message.slice(0, activeCfg.preReviewFilter.gatekeeperMaxInputChars);
+          const wrappedMessage = `<user_content>\n${truncatedMessage}\n</user_content>`;
+          const rawResult = await reviewerClient.review<GatekeeperResult>(GATEKEEPER_SYSTEM_PROMPT, wrappedMessage);
+          const gateResult = validateGatekeeperResult(rawResult);
+          if (gateResult && !gateResult.needReview) {
+            turn.trivialTurn = true;
+            api.logger.info(`[PreReviewFilter] Layer2 SKIP (gatekeeper): ${gateResult.reason}`);
+            auditLog.record({
+              sessionId,
+              type: 'output_review',
+              action: 'info',
+              details: `gatekeeper_skip: ${gateResult.reason}`,
+              timestamp: Date.now(),
+            });
+          } else {
+            api.logger.info(`[PreReviewFilter] Layer2 PASS (gatekeeper): ${gateResult?.reason ?? 'no result'}`);
+            goalParser.parseGoal(message, turn, _anchors);
+          }
+        } catch (err) {
+          api.logger.error(`[PreReviewFilter] Gatekeeper failed: ${err instanceof Error ? err.message : String(err)}`);
+          goalParser.parseGoal(message, turn, _anchors);
+        }
       }
     });
 
     // before_prompt_build — inject supervisor rules + session anchors + drained prepend queue + course corrections
-    api.on('before_prompt_build', (ctx: unknown) => {
+    api.on('before_prompt_build', (_event: unknown, hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
 
-      const c = ctx as { sessionId?: string };
-      const sessionId = c.sessionId ?? _hookActiveSessionId ?? undefined;
+      const ct = hookCtx as { sessionId?: string; agentId?: string; sessionKey?: string };
+      const sessionId = ct.sessionId ?? _hookActiveSessionId ?? undefined;
 
       let turn: TurnState | undefined;
       if (sessionId) {
@@ -409,104 +483,56 @@ const plugin: PluginDefinition = {
       return merged ? { prependContext: merged } : {};
     });
 
-    // message_received — create a fresh TurnState for this message and bind
-    // it to the async chain via AsyncLocalStorage. Run pre-review filter,
-    // gatekeeper, and goal parser against the per-turn state captured in the
-    // closure.
-    api.on('message_received', (ctx: unknown) => {
+    // message_received — lightweight diagnostic hook only.
+    api.on('message_received', (event: unknown, _hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
 
-      const context = ctx as { sessionId?: string; message?: string };
-      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
-      if (!sessionId) return {};
-
-      const message = context.message ?? '';
-      const turn = _registry.create(sessionId, message);
-      // Bind this turn into AsyncLocalStorage. Subsequent synchronous and
-      // awaited hook handlers in the same async chain will pick it up.
-      turnStore.enterWith(turn);
-
-      diag(
-        `message_received: created turn ${turn.turnId} for session ${sessionId} (messageLen=${message.length})`,
-      );
-
-      if (message.length > 0) {
-        const localResult = preReviewFilter.shouldReview(message);
-
-        if (localResult.decision === 'skip') {
-          turn.trivialTurn = true;
-          api.logger.info(`[PreReviewFilter] Layer1 SKIP: ${localResult.reason}`);
-          auditLog.record({
-            sessionId,
-            type: 'output_review',
-            action: 'info',
-            details: `pre_review_filter_skip: ${localResult.reason}`,
-            timestamp: Date.now(),
-          });
-          return {};
-        }
-
-        const truncatedMessage = message.slice(0, activeCfg.preReviewFilter.gatekeeperMaxInputChars);
-        const wrappedMessage = `<user_content>\n${truncatedMessage}\n</user_content>`;
-        reviewerClient.review<GatekeeperResult>(GATEKEEPER_SYSTEM_PROMPT, wrappedMessage)
-          .then((rawResult) => {
-            const gateResult = validateGatekeeperResult(rawResult);
-            if (turn.phase === 'sent') {
-              api.logger.warn(`[PreReviewFilter] Gatekeeper callback: turn ${turn.turnId} already finished, skipping.`);
-              return;
-            }
-            if (gateResult && !gateResult.needReview) {
-              turn.trivialTurn = true;
-              api.logger.info(`[PreReviewFilter] Layer2 SKIP (gatekeeper): ${gateResult.reason}`);
-              auditLog.record({
-                sessionId,
-                type: 'output_review',
-                action: 'info',
-                details: `gatekeeper_skip: ${gateResult.reason}`,
-                timestamp: Date.now(),
-              });
-            } else {
-              api.logger.info(`[PreReviewFilter] Layer2 PASS (gatekeeper): ${gateResult?.reason ?? 'no result'}`);
-              goalParser.parseGoal(message, turn, _anchors);
-            }
-          })
-          .catch((err) => {
-            api.logger.error(`[PreReviewFilter] Gatekeeper failed: ${err instanceof Error ? err.message : String(err)}`);
-            if (turn.phase !== 'sent') {
-              goalParser.parseGoal(message, turn, _anchors);
-            }
-          });
-        return {};
-      }
-
+      const ev = event as { content?: string; from?: string };
+      diag(`message_received: messageLen=${(ev.content ?? '').length}, from=${ev.from ?? '(unknown)'}, turn creation deferred to before_agent_reply`);
       return {};
     });
 
     // llm_input — consistency check + enqueue correction via PendingBlock
-    api.on('llm_input', async (ctx: unknown) => {
+    api.on('llm_input', async (event: unknown, hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return;
       }
 
-      const messages = extractLlmInputMessages(ctx);
+      const ev = event as Record<string, unknown>;
+      const ct = hookCtx as { sessionId?: string; agentId?: string };
+      const messages = extractLlmInputMessages(ev);
       if (!messages || messages.length === 0) {
         return;
       }
 
-      const context = ctx as { sessionId?: string };
-      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
+      const sessionId = (ev.sessionId as string | undefined) ?? ct.sessionId ?? _hookActiveSessionId ?? undefined;
 
-      const turn = resolveTurn(
+      // Update _hookActiveSessionId if we just got one
+      if (sessionId && !_hookActiveSessionId) {
+        _hookActiveSessionId = sessionId;
+      }
+
+      let turn = resolveTurn(
         _registry,
         sessionId,
         'llm_input',
         { userMessage: extractLastUserMessageText(messages) },
         api.logger,
       );
+
+      // Fallback: if before_agent_reply missed creating a turn,
+      // create one here as a last resort
+      if (!turn && sessionId) {
+        const userMessage = extractLastUserMessageText(messages) ?? '';
+        turn = _registry.create(sessionId, userMessage);
+        turnStore.enterWith(turn);
+        diag(`llm_input: fallback turn creation ${turn.turnId} for session ${sessionId}`);
+      }
+
       if (!turn) {
         diag(`llm_input: no active turn for session ${sessionId ?? '(none)'}`);
         return;
@@ -528,17 +554,23 @@ const plugin: PluginDefinition = {
     // llm_output — record raw output, extract structured summary, run course
     // correction and output review. All async work captures the exact turn in
     // its closure with a stale-turn guard.
-    api.on('llm_output', (ctx: unknown) => {
+    api.on('llm_output', (event: unknown, hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return;
       }
 
-      const context = ctx as Record<string, unknown>;
-      const outputText = extractLlmOutputText(context);
-      const sessionId = (context.sessionId as string | undefined) ?? _hookActiveSessionId ?? undefined;
+      const ev = event as Record<string, unknown>;
+      const ct = hookCtx as { sessionId?: string };
+      const outputText = extractLlmOutputText(ev);
+      const sessionId = (ev.sessionId as string | undefined) ?? ct.sessionId ?? _hookActiveSessionId ?? undefined;
 
-      diag(`llm_output ENTERED. sessionId=${sessionId}, hasOutputText=${!!outputText}, outputLen=${outputText?.length ?? 0}, ctxKeys=${Object.keys(context).join(',')}`);
+      // Update _hookActiveSessionId if we just got one
+      if (sessionId && !_hookActiveSessionId) {
+        _hookActiveSessionId = sessionId;
+      }
+
+      diag(`llm_output ENTERED. sessionId=${sessionId}, hasOutputText=${!!outputText}, outputLen=${outputText?.length ?? 0}`);
 
       if (!sessionId || !outputText) {
         diag(`llm_output EARLY EXIT. sessionId=${sessionId}, hasOutputText=${!!outputText}`);
@@ -597,20 +629,23 @@ const plugin: PluginDefinition = {
 
     // message_sending — for channel delivery, attach review footer (cached or
     // live) then finalize the turn.
-    api.on('message_sending', async (ctx: unknown) => {
+    api.on('message_sending', async (event: unknown, hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
-      const context = ctx as { sessionId?: string; message?: string };
-      diag(`message_sending ENTERED. enabled=${activeCfg.enabled}, reviewMode=${activeCfg.reviewMode}, hasMessage=${!!context.message}, messageLen=${context.message?.length ?? 0}, sessionId=${context.sessionId ?? '(none)'}`);
+      const ev = event as { to?: string; content?: string; metadata?: Record<string, unknown> };
+      const ct = hookCtx as { channelId?: string; accountId?: string; conversationId?: string };
+      const message = ev.content ?? '';
+      const mergedCtx = { ...ev, ...ct, ...(ev.metadata ?? {}) };
+      diag(`message_sending ENTERED. enabled=${activeCfg.enabled}, reviewMode=${activeCfg.reviewMode}, hasContent=${!!message}, contentLen=${message.length}`);
 
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
 
-      if (!context.message) {
+      if (!message) {
         return {};
       }
 
-      const snap = snapshotMessageSendingCtx(ctx);
+      const snap = snapshotMessageSendingCtx(mergedCtx);
       const isChannelDelivery = snap.isChannelDelivery;
       diag(`message_sending: isChannelDelivery=${isChannelDelivery}, channel=${JSON.stringify(snap.flags.channel)}, source=${JSON.stringify(snap.flags.source)}`);
 
@@ -619,7 +654,7 @@ const plugin: PluginDefinition = {
         return {};
       }
 
-      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
+      const sessionId = _hookActiveSessionId ?? undefined;
       const turn = resolveTurn(_registry, sessionId, 'sending', {}, api.logger);
       if (!turn) {
         diag(`message_sending: no active turn for session ${sessionId ?? '(none)'}; passing through`);
@@ -641,7 +676,7 @@ const plugin: PluginDefinition = {
           const footer = turn.pendingChannelReviewFooter;
           turn.pendingChannelReviewFooter = undefined;
           diag(`message_sending: Found CACHED channel footer (${footer.length} chars), returning it`);
-          return { message: footer };
+          return { content: footer };
         }
 
         if (!activeCfg.appendReviewToChannelOutput) {
@@ -652,7 +687,7 @@ const plugin: PluginDefinition = {
         diag(`message_sending: No cached footer, performing LIVE review for turn ${turn.turnId}`);
         const reviewStartTime = Date.now();
         const modified = await outputReviewer.reviewMessageSending(
-          context.message,
+          message,
           turn,
           sessionId ? _anchors.view(sessionId) : undefined,
           sessionId ? _anchors : undefined,
@@ -662,7 +697,7 @@ const plugin: PluginDefinition = {
 
         if (modified !== null) {
           diag(`message_sending: LIVE review completed in ${elapsed}ms, returning modified (${modified.length} chars)`);
-          return { message: modified };
+          return { content: modified };
         }
 
         diag(`message_sending: LIVE review returned null in ${elapsed}ms.`);
@@ -688,20 +723,21 @@ const plugin: PluginDefinition = {
     });
 
     // before_tool_call — tool call review (sessionId-scoped, no turn needed)
-    api.on('before_tool_call', async (ctx: unknown) => {
+    api.on('before_tool_call', async (event: unknown, hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
 
-      const context = ctx as { sessionId?: string; params?: Record<string, unknown> };
-      const tool = extractToolCallName(ctx);
+      const ev = event as { toolName?: string; params?: Record<string, unknown>; tool?: string };
+      const ct = hookCtx as { sessionId?: string };
+      const tool = ev.toolName ?? ev.tool;
       if (!tool) {
         return {};
       }
 
-      const sessionId = context.sessionId ?? _hookActiveSessionId ?? 'default';
-      const result = await toolReviewer.review(tool, context.params ?? {}, sessionId);
+      const sessionId = ct.sessionId ?? _hookActiveSessionId ?? 'default';
+      const result = await toolReviewer.review(tool, ev.params ?? {}, sessionId);
 
       if (result.block) {
         return { block: true, blockReason: result.blockReason };
@@ -714,58 +750,59 @@ const plugin: PluginDefinition = {
     });
 
     // before_compaction — capture key memory into compaction event (no turn required)
-    api.on('before_compaction', async (ctx: unknown) => {
+    api.on('before_compaction', async (event: unknown, hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return {};
       }
 
-      const context = ctx as { sessionId?: string; messages?: Array<{ role: string; content: unknown }> };
-      if (!context.messages) {
+      const ev = event as { messages?: Array<{ role: string; content: unknown }> };
+      const ct = hookCtx as { sessionId?: string };
+      if (!ev.messages) {
         return {};
       }
 
-      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
+      const sessionId = ct.sessionId ?? _hookActiveSessionId ?? undefined;
       if (!sessionId) {
         return {};
       }
 
-      const ev = _compactions.begin(sessionId);
-      await memoryGuardian.beforeCompaction(context.messages, ev);
+      const compEv = _compactions.begin(sessionId);
+      await memoryGuardian.beforeCompaction(ev.messages, compEv);
     });
 
     // after_compaction — memory loss detection + anchors merge
-    api.on('after_compaction', async (ctx: unknown) => {
+    api.on('after_compaction', async (event: unknown, hookCtx: unknown) => {
       const activeCfg = _activeConfig ?? cfg;
       if (!isSupervisorActive(activeCfg)) {
         return;
       }
 
-      const context = ctx as {
-        sessionId?: string;
+      const ev = event as {
         original?: Array<{ role: string; content: unknown }>;
         compacted?: Array<{ role: string; content: unknown }>;
       };
+      const ct = hookCtx as { sessionId?: string };
 
-      if (!context.original || !context.compacted) {
+      if (!ev.original || !ev.compacted) {
         return;
       }
 
-      const sessionId = context.sessionId ?? _hookActiveSessionId ?? undefined;
+      const sessionId = ct.sessionId ?? _hookActiveSessionId ?? undefined;
       if (!sessionId) {
         return;
       }
 
-      const ev = _compactions.current(sessionId);
-      if (!ev) {
+      const compEv = _compactions.current(sessionId);
+      if (!compEv) {
         diag(`after_compaction: no compaction event for session ${sessionId}`);
         return;
       }
 
       await memoryGuardian.afterCompaction(
-        context.original,
-        context.compacted,
-        ev,
+        ev.original,
+        ev.compacted,
+        compEv,
         _anchors.view(sessionId),
         _anchors,
       );
@@ -774,17 +811,19 @@ const plugin: PluginDefinition = {
 
     // session_end — emit regeneration summaries for any still-active turns,
     // then drop the entire session from the registry.
-    api.on('session_end', (ctx: unknown) => {
-      const context = ctx as { sessionId?: string };
-      if (!context.sessionId) return;
+    api.on('session_end', (event: unknown, hookCtx: unknown) => {
+      const ev = event as { sessionId?: string };
+      const ct = hookCtx as { sessionId?: string };
+      const sessionId = ev.sessionId ?? ct.sessionId;
+      if (!sessionId) return;
 
-      const activeTurns = _registry.listActive(context.sessionId);
+      const activeTurns = _registry.listActive(sessionId);
       for (const turn of activeTurns) {
         if (turn.regenerateHistory.length > 0) {
           const summary = courseCorrector.buildRegenerationSummary(turn);
           if (summary) {
             auditLog.record({
-              sessionId: context.sessionId,
+              sessionId,
               type: 'force_regenerate',
               action: 'info',
               details: summary,
@@ -795,15 +834,15 @@ const plugin: PluginDefinition = {
         }
         _registry.finish(turn);
       }
-      _registry.dropSession(context.sessionId);
-      _anchors.drop(context.sessionId);
-      _compactions.dropAll(context.sessionId);
-      if (context.sessionId === _hookActiveSessionId) {
+      _registry.dropSession(sessionId);
+      _anchors.drop(sessionId);
+      _compactions.dropAll(sessionId);
+      if (sessionId === _hookActiveSessionId) {
         _hookActiveSessionId = null;
       }
     });
 
-    api.logger.info('Dual Model Supervisor registered (7 hooks + 6 RPC methods)');
+    api.logger.info('Dual Model Supervisor registered (8 hooks + 6 RPC methods)');
     _hooksDone = true;
     } // end _hooksDone guard
   },
