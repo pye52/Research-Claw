@@ -8,7 +8,6 @@ import {
   validateMemoryLossItems,
   validateKeyMemoryItems,
   validateDeviationAnalysis,
-  validateForceRegenerateCorrection,
   validateGatekeeperResult,
   validateTargetConclusionCheck,
 } from '../core/validators.js';
@@ -257,21 +256,45 @@ describe('validateDeviationAnalysis', () => {
     expect(r!.deviation).toBe(0.7);
     expect(r!.memoryLoss).toBe(true);
   });
-});
 
-describe('validateForceRegenerateCorrection', () => {
-  it('accepts valid response', () => {
-    const r = validateForceRegenerateCorrection({
-      correctionInstruction: 'Focus on methodology',
-      deviationSummary: 'Deviated from research goal',
+  it('accepts correctionInstruction and deviationSummary when deviation exceeds threshold', () => {
+    const r = validateDeviationAnalysis({
+      deviation: 0.8,
+      memoryLoss: false,
+      qualityScore: 0.2,
+      courseCorrection: 'Return to research goal',
+      summary: 'Severe topic drift',
+      correctionInstruction: 'You must focus on carbapenem resistance only',
+      deviationSummary: 'Assistant pivoted to unrelated hypertension topic',
     });
-    expect(r).not.toBeNull();
-    expect(r!.correctionInstruction).toBe('Focus on methodology');
+    expect(r!.correctionInstruction).toBe('You must focus on carbapenem resistance only');
+    expect(r!.deviationSummary).toBe('Assistant pivoted to unrelated hypertension topic');
   });
 
-  it('returns null for empty correctionInstruction', () => {
-    const r = validateForceRegenerateCorrection({ deviationSummary: 'test' });
-    expect(r).toBeNull();
+  it('returns empty strings for correctionInstruction and deviationSummary when not provided', () => {
+    const r = validateDeviationAnalysis({
+      deviation: 0.2,
+      memoryLoss: false,
+      qualityScore: 0.9,
+      courseCorrection: '',
+      summary: 'On track',
+    });
+    expect(r!.correctionInstruction).toBe('');
+    expect(r!.deviationSummary).toBe('');
+  });
+
+  it('trims whitespace from correctionInstruction', () => {
+    const r = validateDeviationAnalysis({
+      deviation: 0.6,
+      memoryLoss: false,
+      qualityScore: 0.5,
+      courseCorrection: '',
+      summary: '',
+      correctionInstruction: '  Stay on topic  ',
+      deviationSummary: '  Deviated  ',
+    });
+    expect(r!.correctionInstruction).toBe('Stay on topic');
+    expect(r!.deviationSummary).toBe('Deviated');
   });
 });
 

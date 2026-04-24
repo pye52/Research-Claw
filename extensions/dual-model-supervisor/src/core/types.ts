@@ -202,13 +202,22 @@ export interface TurnState {
   turnLlmOutput?: string;          // Raw LLM output of this turn
 
   /**
-   * Signal flag for force regeneration (set by CourseCorrector, consumed by OutputReviewer).
+   * Unified signal: current output is unusable and must be regenerated.
+   * Set by Step 2 (CourseCorrector, deviation) or Step 3 (deepReview, blocked).
+   * Consumed by message_sending to intercept output and trigger regeneration.
    */
-  forceRegeneratePending?: boolean;
+  shouldRegenerate?: boolean;
   regenerateHistory: RegenerateHistoryEntry[];  // History of regenerate attempts in this turn
 
   // ── Output review pipeline (llm_output → message_sending hand-off within turn) ──
-  pendingChannelReviewFooter?: string; // Cached footer for channel delivery
+  /** Promise coordinating Steps 1→2→3 between llm_output and message_sending.
+   *  llm_output stores the promise; message_sending awaits it before deciding.
+   *  Resolves to ReviewResult | null (null when Step 3 is skipped or fails).
+   *  Wraps Step 1 (extractSummary) → Step 2 (analyzeSession) → Step 3 (deepReview)
+   *  in a 60s timeout. Step 3 is skipped if shouldRegenerate=true after Step 2.
+   */
+  reviewPromise?: Promise<ReviewResult | null>;
+
   lastReviewReport?: string;       // Human-readable review report (Dashboard display)
   trivialTurn?: boolean;           // Pre-review filter verdict for this turn
 

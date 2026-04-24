@@ -1,34 +1,15 @@
 /**
- * Dual Model Supervisor — OutputReviewer (`message_sending` hook)
+ * Dual Model Supervisor — OutputReviewer
  *
- * Responsibilities (listed in inspection order / priority)
- *  1. **Force-regenerate interception**: If `turn.forceRegeneratePending` is true (set by
- *     CourseCorrector during the llm_output phase) and maxRegenerateAttempts has not been reached,
- *     replace the entire output with a "🔄 [Supervisor] Output blocked …" prompt (causing the gateway
- *     to trigger regeneration once more).
- *  2. **Idempotency skip**: If the message already contains SUPERVISOR_REVIEW_SUMMARY_MARKER,
- *     a footer has already been appended → pass through directly (avoid duplicate appends during
- *     retries / multiple hook triggers).
- *  3. **QuickChecker synchronous quick check**: If dangerous / privacy rules are hit → replace the
- *     message with a short block prompt.
- *  4. **deepReview**: Invoke the reviewer model for a complete output quality assessment. Results are:
- *      - written to turn.lastReviewReport (for dashboard display);
- *      - pushed into anchors.recentReviewReports and enqueued as a previousReview block,
- *        so the next turn's prepend sees "what the reviewer noted last time".
- *  5. **Footer append (optional)**: Only when attachSummary=true (external channel delivery),
- *     append quick warnings and the deep review report to the end of the message body.
- *     Dashboard messages do not append a footer; they rely on the panel for separate display.
+ * Provides `deepReview()` for the Step 3 pipeline stage (now called from
+ * `llm_output` via index.ts, no longer from `message_sending`).
+ *
+ * `reviewMessageSending()` is retained for backward compatibility but is no
+ * longer the primary entry point for the message_sending hook in index.ts.
+ * The inline logic in index.ts now awaits `turn.reviewPromise` directly,
+ * making this method unused in the main flow.
  *
  * Design rationale
- *  - **force-regenerate must happen before all other checks**: once deviation-regeneration is identified,
- *    the entire output should not be shown to the user; quick check / deep review overhead is wasteful
- *    in this case.
- *  - **maxRegenerateAttempts safety net**: avoid infinite loops. When the reviewer persistently flags
- *    deviation, let the user see the "imperfect output" once the limit is exceeded — at least don't
- *    deadlock the conversation.
- *  - **deep review still runs even when attachSummary is false**: so that the review report is written
- *    into anchors and prepared for the next turn's LLM context — this is the key feedback loop for
- *    quality improvement.
  *  - **deepReview failure is non-blocking**: when the reviewer is unavailable, return null, send the
  *    body as normal, and write "Deep review did not return a result..." in the footer to maintain
  *    transparency.
@@ -115,10 +96,10 @@ export class OutputReviewer {
 
     const sessionId = turn?.sessionId ?? 'unknown';
 
-    // ── Priority 1: force-regenerate interception ──────────────────────────
+    // ── Priority 1: regeneration interception ──────────────────────────
     // Must happen before all other checks. Once hit and limit not reached, the entire output is suppressed;
     // the gateway will re-trigger generation upon receiving this block text (carrying prepend correction instructions).
-    if (turn && isForceRegenerateActive(this.config) && turn.forceRegeneratePending) {
+    if (turn && isForceRegenerateActive(this.config) && turn.shouldRegenerate) {
       if (turn.regenerateHistory.length < this.config.courseCorrection.maxRegenerateAttempts) {
         const maxAttempts = this.config.courseCorrection.maxRegenerateAttempts;
         const attempt = turn.regenerateHistory.length + 1;

@@ -214,7 +214,8 @@ export function validateKeyMemoryItems(raw: unknown): MemoryItem[] {
 }
 
 /**
- * Validate course correction / deviation analysis response.
+ * Validate course correction / deviation analysis response from the reviewer.
+ * Returns sanitized fields with scores clamped to [0, 1] and strings trimmed.
  */
 export function validateDeviationAnalysis(raw: unknown): {
   deviation: number;
@@ -222,23 +223,6 @@ export function validateDeviationAnalysis(raw: unknown): {
   qualityScore: number;
   courseCorrection: string;
   summary: string;
-} | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const r = raw as Record<string, unknown>;
-
-  return {
-    deviation: clamp01(r.deviation),
-    memoryLoss: isBoolean(r.memoryLoss) ? r.memoryLoss : false,
-    qualityScore: clamp01(r.qualityScore),
-    courseCorrection: isString(r.courseCorrection) ? r.courseCorrection : '',
-    summary: isString(r.summary) ? r.summary : '',
-  };
-}
-
-/**
- * Validate force-regenerate correction instruction response.
- */
-export function validateForceRegenerateCorrection(raw: unknown): {
   correctionInstruction: string;
   deviationSummary: string;
 } | null {
@@ -246,11 +230,17 @@ export function validateForceRegenerateCorrection(raw: unknown): {
   const r = raw as Record<string, unknown>;
 
   const correctionInstruction = isString(r.correctionInstruction) ? r.correctionInstruction.trim() : '';
-  if (!correctionInstruction) return null;
 
   return {
+    deviation: clamp01(r.deviation),
+    memoryLoss: isBoolean(r.memoryLoss) ? r.memoryLoss : false,
+    qualityScore: clamp01(r.qualityScore),
+    courseCorrection: isString(r.courseCorrection) ? r.courseCorrection : '',
+    summary: isString(r.summary) ? r.summary : '',
+    // When deviation > threshold the merged prompt MUST provide correctionInstruction;
+    // when within threshold it may be absent/empty — both are valid.
     correctionInstruction,
-    deviationSummary: isString(r.deviationSummary) ? r.deviationSummary : '',
+    deviationSummary: isString(r.deviationSummary) ? r.deviationSummary.trim() : '',
   };
 }
 

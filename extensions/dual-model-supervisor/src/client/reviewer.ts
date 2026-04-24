@@ -82,10 +82,16 @@ export class ReviewerClient {
   private _adapter: ReviewerApiAdapter | null = null;
 
   /**
-   * Serialize all reviewer HTTP calls. Multiple hooks (summary extract, output review, consistency, …)
-   * previously issued concurrent requests and could exhaust connections or destabilize the gateway.
+   * Serialize reviewer HTTP calls with limited concurrency.
+   * Allows up to N (default 3) concurrent API calls so Steps 1→2→3 within a turn do not starve each other.
+   * Uses a semaphore pattern: callers enqueue and are dispatched when a slot opens.
    */
   private _reviewQueue: Promise<void> = Promise.resolve();
+  private _running: number = 0;
+  private _queueDepth: number = 0;
+  private readonly _maxConcurrency: number = 3;
+  /** Queue of resolve callbacks for callers waiting for a concurrency slot. */
+  private _waiters: Array<() => void> = [];
 
   constructor(opts: ReviewerClientOptions) {
     this.supervisorConfig = opts.supervisorConfig;
@@ -151,6 +157,7 @@ export class ReviewerClient {
 
   /**
    * Call the reviewer model. Returns parsed JSON or null on failure.
+   * Uses a semaphore to limit concurrent calls to _maxConcurrency.
    */
   async review<T>(systemPrompt: string, userContent: string): Promise<T | null> {
     const key = cacheKey(systemPrompt, userContent);
@@ -159,14 +166,37 @@ export class ReviewerClient {
       return cached;
     }
 
-    const run = this._reviewQueue
+    this._queueDepth++;
+
+    // Acquire a concurrency slot (semaphore acquire).
+    await this._reviewQueue
+      .catch(() => undefined);
+
+    if (this._running >= this._maxConcurrency) {
+      // No slot available; enqueue a waiter and wait for release.
+      this._queueDepth--;
+      await new Promise<void>((resolve) => {
+        this._waiters.push(resolve);
+      });
+    }
+
+    this._running++;
+
+    // Wrap with _reviewQueue chain for ordering: when this call finishes,
+    // it must signal the next waiter if any.
+    const prev = this._reviewQueue
       .catch(() => undefined)
-      .then(() => this._reviewAfterQueue<T>(systemPrompt, userContent, key));
-    this._reviewQueue = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+      .then(() => this._reviewAfterQueue<T>(systemPrompt, userContent, key))
+      .finally(() => {
+        this._running--;
+        const next = this._waiters.shift();
+        if (next) {
+          next();
+        }
+      });
+
+    this._reviewQueue = prev.then(() => {});
+    return prev as Promise<T | null>;
   }
 
   private async _reviewAfterQueue<T>(
@@ -174,6 +204,7 @@ export class ReviewerClient {
     userContent: string,
     key: string,
   ): Promise<T | null> {
+    const start = Date.now();
     try {
       const result = await this._callApi(systemPrompt, userContent);
       if (result !== null) {
@@ -181,7 +212,8 @@ export class ReviewerClient {
       }
       return result as T | null;
     } catch (err) {
-      this.logger.error(`Reviewer call failed: ${err instanceof Error ? err.message : String(err)}`);
+      const latency = Date.now() - start;
+      this.logger.error(`[ReviewCall] _callApi FAILED key=${key.slice(0, 16)}... latency=${latency}ms error=${err instanceof Error ? err.message : String(err)}`);
       return null;
     }
   }
@@ -241,11 +273,12 @@ export class ReviewerClient {
     const headers = adapter.buildHeaders(providerCfg);
     const body = adapter.buildBody(providerCfg, parsed.modelId, systemPrompt, userContent);
 
+    const httpStart = Date.now();
     const response = await fetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(60_000),
     });
 
     if (!response.ok) {

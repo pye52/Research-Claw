@@ -3,14 +3,12 @@
  *
  * Responsibilities
  *  1. **Session-level deviation analysis** (`analyzeSession` → `_doAnalyze`, runs at the `llm_output` stage):
- *     Uses the reviewer with SESSION_ANALYSIS_SYSTEM_PROMPT to produce session-level assessments like
- *     deviation / qualityScore / courseCorrection. When deviation exceeds the threshold:
+ *     Calls the reviewer with SESSION_ANALYSIS_SYSTEM_PROMPT to produce session-level assessments
+ *     (deviation / qualityScore / courseCorrection). When deviation exceeds the threshold:
  *       - Enqueues a `driftCorrection` block (prepended next turn as a soft reminder);
- *       - If force-regenerate is enabled and the limit has not been reached, invokes
- *         FORCE_REGENERATE_CORRECTION_PROMPT once more to generate a specific correction instruction,
- *         enqueues a `forceRegenerate` block, and sets `turn.forceRegeneratePending = true` —
- *         the block is the sole source of prepend data; the flag is only a signal for OutputReviewer
- *         to intercept output during the message_sending phase.
+ *       - If force-regenerate is enabled and the limit has not been reached, enqueues a `forceRegenerate`
+ *         block and sets `turn.shouldRegenerate = true` — the block is the sole source of prepend
+ *         data; the flag is only a signal for the message_sending handler to intercept output.
  *  2. **Prepend context injection** (`buildContextInjection`, runs at the `before_prompt_build` stage):
  *     Expands the list of PendingBlocks drained from SessionAnchorsRegistry (lostMemory / consistencyCorrection /
  *     driftCorrection / previousReview / forceRegenerate) into a prependContext string, which the gateway injects at the
@@ -19,10 +17,9 @@
  * Design rationale
  *  - **deviation is owned exclusively by this class**: OutputReviewer.deepReview also returns a
  *    deviationScore, but only as a single-turn quality reference, **not** to trigger force-regenerate;
- *    session-level deviation = multi-turn trend = this class's responsibility. This makes the deviation
- *    signal source unique and avoids duplicate blocks.
- *  - **Single source of truth**: the forceRegenerate block is the sole authoritative source of prepend data;
- *    `turn.forceRegeneratePending` is merely a boolean signal telling OutputReviewer that interception is needed.
+ *    session-level deviation = multi-turn trend = this class's responsibility.
+ *  - **Single source of truth**: the forceRegenerate block is the authoritative source of prepend data;
+ *    `turn.shouldRegenerate` is merely a boolean signal for the message_sending interception.
  *  - **`isTurnFinished` guard**: all branches that may write turn state first check phase==='sent',
  *    preventing pollution of the next turn when async analysis returns after the current turn has ended.
  *  - **regenerateHistory**: synchronously pushes a `regenerating` entry each time prepend is constructed;
@@ -36,10 +33,10 @@ import type { SessionAnchors, PendingBlock } from '../core/session-anchors.js';
 import { SessionAnchorsRegistry } from '../core/session-anchors.js';
 import { ReviewerClient } from '../client/reviewer.js';
 import { AuditLogService } from '../core/audit-log.js';
-import { SESSION_ANALYSIS_SYSTEM_PROMPT, FORCE_REGENERATE_CORRECTION_PROMPT } from '../core/prompts.js';
+import { SESSION_ANALYSIS_SYSTEM_PROMPT } from '../core/prompts.js';
 import { isCourseCorrectionActive, isSupervisorActive, isForceRegenerateActive } from '../core/config.js';
 import { buildAnchorContextLines } from '../utils/anchor-context.js';
-import { validateDeviationAnalysis, validateForceRegenerateCorrection } from '../core/validators.js';
+import { validateDeviationAnalysis } from '../core/validators.js';
 
 function isTurnFinished(turn: TurnState): boolean {
   return (turn.phase as string) === 'sent';
@@ -51,10 +48,9 @@ interface SessionAnalysisResult {
   qualityScore: number;
   courseCorrection: string;
   summary: string;
-}
-
-interface ForceRegenerateCorrectionResult {
+  /** Populated by merged prompt when deviation > threshold; empty string otherwise. */
   correctionInstruction: string;
+  /** Populated by merged prompt when deviation > threshold; empty string otherwise. */
   deviationSummary: string;
 }
 
@@ -81,15 +77,15 @@ export class CourseCorrector {
   }
 
   /**
-   * Synchronous entry point: fire-and-forget to start session-level analysis.
-   * Callers typically trigger this during the `llm_output` phase; does not block the main path return.
+   * Awaiting entry point: runs session-level deviation analysis.
+   * Returns a Promise that resolves when analysis completes (or fails gracefully).
+   * Callers in `llm_output` should `await` this to ensure shouldRegenerate
+   * is set before `message_sending` runs.
    */
-  analyzeSession(turn: TurnState, anchors: Readonly<SessionAnchors>, registry: SessionAnchorsRegistry): void {
-    if (!isCourseCorrectionActive(this.config)) return;
+  analyzeSession(turn: TurnState, anchors: Readonly<SessionAnchors>, registry: SessionAnchorsRegistry): Promise<void> {
+    if (!isCourseCorrectionActive(this.config)) return Promise.resolve();
 
-    this._doAnalyze(turn, anchors, registry).catch((err) => {
-      this.logger.error(`Course correction analysis failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    return this._doAnalyze(turn, anchors, registry);
   }
 
   private async _doAnalyze(
@@ -120,8 +116,15 @@ export class CourseCorrector {
         contextParts.push(`Latest assistant output:\n${turn.turnLlmOutput.slice(0, 12_000)}`);
       }
 
-      if (anchors.recentSummaries.length > 0) {
-        const summaryText = anchors.recentSummaries
+      // Merge staged summaries from Step 1 with historical summaries for context.
+      // Step 1's extractSummary result lives in turn.stagedAnchorUpdates.recentSummaries;
+      // historical summaries are in anchors.recentSummaries.
+      const allSummaries = [
+        ...anchors.recentSummaries,
+        ...(turn.stagedAnchorUpdates.recentSummaries ?? []),
+      ];
+      if (allSummaries.length > 0) {
+        const summaryText = allSummaries
           .slice(-5)
           .map((s) => {
             const parts: string[] = [];
@@ -171,21 +174,22 @@ export class CourseCorrector {
           const maxAttempts = this.config.courseCorrection.maxRegenerateAttempts;
           const attempts = turn.regenerateHistory.length;
           if (attempts < maxAttempts) {
-            // Hard path: invoke the reviewer once more to generate a specific correctionInstruction.
-            // Also set turn.forceRegeneratePending = true (OutputReviewer uses it to intercept during message_sending)
-            // and PendingBlock (before_prompt_build uses it to construct prepend) — dual delivery guarantees at least one side triggers.
-            const correctionResult = await this._generateForceRegenerateCorrection(turn, anchors, result);
-            if (correctionResult && !isTurnFinished(turn)) {
+            // Hard path (merged): correctionInstruction + deviationSummary are already in result
+            // from the single merged SESSION_ANALYSIS_SYSTEM_PROMPT call — no second LLM round-trip needed.
+            const instruction = result.correctionInstruction || result.courseCorrection;
+            const deviationSummary = result.deviationSummary || result.summary;
+
+            if (instruction && !isTurnFinished(turn)) {
               const originalPreview = turn.turnLlmOutput
                 ? turn.turnLlmOutput.slice(0, 200)
                 : '(no output captured)';
 
-              turn.forceRegeneratePending = true;
+              turn.shouldRegenerate = true;
 
               registry.enqueueBlock(turn.sessionId, {
                 type: 'forceRegenerate',
                 deviationScore: result.deviation,
-                correctionInstruction: correctionResult.correctionInstruction,
+                correctionInstruction: instruction,
                 originalOutputPreview: originalPreview,
               });
 
@@ -193,8 +197,8 @@ export class CourseCorrector {
                 sessionId: turn.sessionId,
                 type: 'force_regenerate',
                 action: 'block',
-                details: `Deviation ${result.deviation.toFixed(2)} triggered force regeneration (attempt ${attempts + 1}/${maxAttempts}): ${correctionResult.deviationSummary}`,
-                metadata: JSON.stringify(correctionResult),
+                details: `Deviation ${result.deviation.toFixed(2)} triggered force regeneration (attempt ${attempts + 1}/${maxAttempts}): ${deviationSummary}`,
+                metadata: JSON.stringify({ correctionInstruction: instruction, deviationSummary }),
                 timestamp: Date.now(),
               });
             }
@@ -221,47 +225,6 @@ export class CourseCorrector {
       }
     } catch (err) {
       this.logger.error(`Course correction analysis failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  private async _generateForceRegenerateCorrection(
-    turn: TurnState,
-    anchors: Readonly<SessionAnchors>,
-    analysisResult: SessionAnalysisResult,
-  ): Promise<ForceRegenerateCorrectionResult | null> {
-    const contextParts: string[] = [];
-
-    if (anchors.researchGoal) {
-      contextParts.push(`Research goal: ${anchors.researchGoal}`);
-    }
-    if (anchors.targetConclusions.length > 0) {
-      contextParts.push(`Target conclusions: ${anchors.targetConclusions.join('; ')}`);
-    }
-    if (turn.turnLlmOutput) {
-      contextParts.push(`Deviated output:\n${turn.turnLlmOutput.slice(0, 1000)}`);
-    }
-    contextParts.push(`Deviation score: ${analysisResult.deviation.toFixed(2)}`);
-    contextParts.push(`Initial correction note: ${analysisResult.courseCorrection}`);
-
-    if (turn.regenerateHistory.length > 0) {
-      const previousAttempts = turn.regenerateHistory
-        .map((h) => `Attempt ${h.attempt}: deviation=${h.deviationScore.toFixed(2)}, result=${h.result}`)
-        .join('; ');
-      contextParts.push(`Previous regeneration attempts: ${previousAttempts}`);
-    }
-
-    const rawContent = contextParts.join('\n\n');
-    const userContent = `<user_content>\n${rawContent}\n</user_content>`;
-
-    try {
-      const raw = await this.reviewerClient.review<Record<string, unknown>>(
-        FORCE_REGENERATE_CORRECTION_PROMPT,
-        userContent,
-      );
-      return validateForceRegenerateCorrection(raw);
-    } catch (err) {
-      this.logger.error(`Force regenerate correction generation failed: ${err instanceof Error ? err.message : String(err)}`);
-      return null;
     }
   }
 

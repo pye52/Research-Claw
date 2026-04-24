@@ -75,12 +75,16 @@ export class SummaryExtractor {
     this.config = config;
   }
 
-  extractSummary(output: string, turn: TurnState): void {
-    if (!isSupervisorActive(this.config)) return;
+  /**
+   * Awaiting entry point: extracts a structured summary from the output.
+   * Returns a Promise that resolves when extraction completes (or fails gracefully).
+   * Callers in `llm_output` should `await` this to ensure summaries are available
+   * before `message_sending` runs.
+   */
+  extractSummary(output: string, turn: TurnState): Promise<void> {
+    if (!isSupervisorActive(this.config)) return Promise.resolve();
 
-    this._doExtract(output, turn).catch((err) => {
-      this.logger.error(`Summary extraction failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    return this._doExtract(output, turn);
   }
 
   private async _doExtract(output: string, turn: TurnState): Promise<void> {

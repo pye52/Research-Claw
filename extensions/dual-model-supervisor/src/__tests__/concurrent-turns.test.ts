@@ -10,7 +10,7 @@ import {
   turnStore,
   resolveTurn,
 } from '../core/turn-context.js';
-import type { TurnState } from '../core/types.js';
+import type { ReviewResult, TurnState } from '../core/types.js';
 
 /**
  * Minimal stand-in for the three hook phases that mutate TurnState:
@@ -39,21 +39,30 @@ async function runTurnPipeline(
     // --- llm_input (synchronous step, advance phase) ---
     registry.advancePhase(turn, 'llm_input');
 
-    // --- llm_output: schedule async output review ---
-    const outputReview = (async () => {
-      await new Promise((res) => setTimeout(res, opts.reviewDelayMs));
-      if (turn.phase === 'sent') return;
-      turn.pendingChannelReviewFooter = `footer-for-${turn.turnId}`;
-      turn.turnLlmOutput = `output-for-${turn.turnId}`;
-    })();
+    // --- llm_output: set review promise ---
+    turn.reviewPromise = new Promise<ReviewResult | null>((res) =>
+      setTimeout(() => {
+        if (turn.phase === 'sent') { res(null); return; }
+        res({
+          blocked: false,
+          corrected: false,
+          warnings: [],
+          memoryAlerts: [],
+          qualityScore: 0.9,
+          reportText: `report-for-${turn.turnId}`,
+        });
+      }, opts.reviewDelayMs),
+    );
+    turn.turnLlmOutput = `output-for-${turn.turnId}`;
     registry.advancePhase(turn, 'llm_output');
 
-    await Promise.all([goalParse, outputReview]);
+    await goalParse;
+    const reviewResult = await turn.reviewPromise;
 
-    // --- message_sending: consume footer, finish turn ---
+    // --- message_sending: consume review result, finish turn ---
     registry.advancePhase(turn, 'sending');
-    const footer = turn.pendingChannelReviewFooter;
-    turn.pendingChannelReviewFooter = undefined;
+    const footer = reviewResult?.reportText;
+    turn.reviewPromise = undefined;
     registry.finish(turn);
     return footer;
   });
@@ -84,11 +93,11 @@ describe('concurrent turns — B runs first but does not contaminate A', () => {
 
     expect(turnA.stagedAnchorUpdates.researchGoal).toBe('Explain RLHF');
     expect(turnA.turnLlmOutput).toBe(`output-for-${turnA.turnId}`);
-    expect(footerA).toBe(`footer-for-${turnA.turnId}`);
+    expect(footerA).toBe(`report-for-${turnA.turnId}`);
 
     expect(turnB.stagedAnchorUpdates.researchGoal).toBe('Produce code');
     expect(turnB.turnLlmOutput).toBe(`output-for-${turnB.turnId}`);
-    expect(footerB).toBe(`footer-for-${turnB.turnId}`);
+    expect(footerB).toBe(`report-for-${turnB.turnId}`);
 
     expect(registry.listActive('session-1')).toEqual([]);
     expect(turnA.phase).toBe('sent');
